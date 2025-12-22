@@ -351,6 +351,12 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         ))
     }
 
+    /// Returns cache statistics: (total_entries, live_entries, dead_entries)
+    /// Default implementation returns (0, 0, 0) for stores without caching.
+    fn layer_cache_stats(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+
     /// Remove stale entries from the layer cache. Returns number of entries removed.
     /// Default implementation does nothing and returns 0.
     fn cleanup_layer_cache(&self) -> usize {

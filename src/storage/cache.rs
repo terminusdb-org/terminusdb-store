@@ -13,6 +13,12 @@ pub trait LayerCache: 'static + Send + Sync {
 
     fn invalidate(&self, name: [u32; 5]);
 
+    /// Returns statistics about the cache: (total_entries, live_entries, dead_entries)
+    /// Default implementation returns (0, 0, 0) for caches that don't track this.
+    fn cache_stats(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+
     /// Remove stale entries from the cache. Returns number of entries removed.
     /// Default implementation does nothing.
     fn cleanup_stale_entries(&self) -> usize {
@@ -53,6 +59,17 @@ pub struct LockingHashMapLayerCache {
 impl LockingHashMapLayerCache {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// Returns statistics about the cache: (total_entries, live_entries, dead_entries)
+    /// Live entries are those where the Weak reference can still be upgraded.
+    /// Dead entries are stale weak references that should be cleaned up.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let cache = self.cache.read().expect("rwlock read should always succeed, but got poisoned");
+        let total = cache.len();
+        let live = cache.values().filter(|w| w.strong_count() > 0).count();
+        let dead = total - live;
+        (total, live, dead)
     }
 
     /// Remove all stale (dead) weak references from the cache.
@@ -123,6 +140,10 @@ impl LayerCache for LockingHashMapLayerCache {
         cache.remove(&name);
     }
 
+    fn cache_stats(&self) -> (usize, usize, usize) {
+        self.stats()
+    }
+
     fn cleanup_stale_entries(&self) -> usize {
         self.cleanup_stale()
     }
@@ -144,6 +165,11 @@ impl CachedLayerStore {
 
     pub fn invalidate(&self, name: [u32; 5]) {
         self.cache.invalidate(name);
+    }
+
+    /// Returns cache statistics: (total_entries, live_entries, dead_entries)
+    pub fn cache_stats(&self) -> (usize, usize, usize) {
+        self.cache.cache_stats()
     }
 
     /// Remove stale entries from the cache. Returns number of entries removed.
@@ -605,6 +631,10 @@ impl LayerStore for CachedLayerStore {
         upto: [u32; 5],
     ) -> io::Result<Vec<[u32; 5]>> {
         self.inner.retrieve_layer_stack_names_upto(name, upto).await
+    }
+
+    fn layer_cache_stats(&self) -> (usize, usize, usize) {
+        self.cache.cache_stats()
     }
 
     fn cleanup_layer_cache(&self) -> usize {

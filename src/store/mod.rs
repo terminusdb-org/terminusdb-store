@@ -900,6 +900,12 @@ impl Store {
         self.layer_store.import_layers(pack, layer_ids).await
     }
 
+    /// Returns cache statistics: (total_entries, live_entries, dead_entries)
+    /// Dead entries are stale weak references that should be cleaned up.
+    pub fn layer_cache_stats(&self) -> (usize, usize, usize) {
+        self.layer_store.layer_cache_stats()
+    }
+
     /// Remove stale entries from the layer cache. Returns number of entries removed.
     pub fn cleanup_layer_cache(&self) -> usize {
         self.layer_store.cleanup_layer_cache()
