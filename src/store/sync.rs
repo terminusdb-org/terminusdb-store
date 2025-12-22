@@ -604,6 +604,16 @@ impl SyncStore {
     ) -> io::Result<()> {
         task_sync(self.inner.layer_store.import_layers(pack, layer_ids))
     }
+
+    /// Remove stale entries from the layer cache. Returns number of entries removed.
+    pub fn cleanup_layer_cache(&self) -> usize {
+        self.inner.cleanup_layer_cache()
+    }
+
+    /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
+    pub fn invalidate_layer(&self, name: [u32; 5]) {
+        self.inner.invalidate_layer(name);
+    }
 }
 
 /// Open a store that is entirely in memory.

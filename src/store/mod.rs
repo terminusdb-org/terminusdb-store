@@ -899,6 +899,16 @@ impl Store {
     ) -> io::Result<()> {
         self.layer_store.import_layers(pack, layer_ids).await
     }
+
+    /// Remove stale entries from the layer cache. Returns number of entries removed.
+    pub fn cleanup_layer_cache(&self) -> usize {
+        self.layer_store.cleanup_layer_cache()
+    }
+
+    /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
+    pub fn invalidate_layer(&self, name: [u32; 5]) {
+        self.layer_store.invalidate(name);
+    }
 }
 
 /// Open a store that is entirely in memory.
