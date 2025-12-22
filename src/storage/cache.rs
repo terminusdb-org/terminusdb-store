@@ -65,7 +65,10 @@ impl LockingHashMapLayerCache {
     /// Live entries are those where the Weak reference can still be upgraded.
     /// Dead entries are stale weak references that should be cleaned up.
     pub fn stats(&self) -> (usize, usize, usize) {
-        let cache = self.cache.read().expect("rwlock read should always succeed, but got poisoned");
+        let cache = self
+            .cache
+            .read()
+            .expect("rwlock read should always succeed, but got poisoned");
         let total = cache.len();
         let live = cache.values().filter(|w| w.strong_count() > 0).count();
         let dead = total - live;
@@ -75,7 +78,10 @@ impl LockingHashMapLayerCache {
     /// Remove all stale (dead) weak references from the cache.
     /// Returns the number of entries removed.
     pub fn cleanup_stale(&self) -> usize {
-        let mut cache = self.cache.write().expect("rwlock write should always succeed, but got poisoned");
+        let mut cache = self
+            .cache
+            .write()
+            .expect("rwlock write should always succeed, but got poisoned");
         let before = cache.len();
         cache.retain(|_, weak| weak.strong_count() > 0);
         let after = cache.len();
@@ -113,20 +119,20 @@ impl LayerCache for LockingHashMapLayerCache {
             .cache
             .write()
             .expect("rwlock write should always succeed");
-        
+
         // Automatic cleanup: when cache exceeds threshold, check for stale entries
         let cache_size = cache.len();
         if cache_size >= CACHE_CLEANUP_THRESHOLD {
             // Count dead entries
             let dead_count = cache.values().filter(|w| w.strong_count() == 0).count();
             let dead_percentage = (dead_count * 100) / cache_size.max(1);
-            
+
             // Only cleanup if dead entries exceed threshold percentage
             if dead_percentage >= DEAD_ENTRY_PERCENTAGE_THRESHOLD {
                 cache.retain(|_, weak| weak.strong_count() > 0);
             }
         }
-        
+
         cache.insert(layer.name(), Arc::downgrade(&layer));
     }
 
@@ -376,13 +382,13 @@ impl LayerStore for CachedLayerStore {
     async fn register_rollup(&self, layer: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
         // when registering a rollup layer, we need to make sure that
         // the cached version is updated as well.
-        
+
         // Get the entire parent chain before registering the rollup
         // so we can invalidate all old layers from the cache
         let layer_stack = self.inner.retrieve_layer_stack_names(layer).await?;
-        
+
         self.inner.register_rollup(layer, rollup).await?;
-        
+
         // Invalidate the entire parent chain from cache, not just the rolled-up layer.
         // This ensures old layers become "dead" entries that can be cleaned up.
         // Without this, the old parent chain stays "live" because Arc references
