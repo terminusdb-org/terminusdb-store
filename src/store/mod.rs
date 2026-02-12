@@ -23,7 +23,7 @@ use rayon::prelude::*;
 pub struct Store {
     label_store: Arc<dyn LabelStore>,
     layer_store: Arc<dyn LayerStore>,
-    lru_used_bytes_fn: Option<Arc<dyn Fn() -> Option<usize> + Send + Sync>>,
+    lru_used_bytes_fn: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
 }
 
 /// A wrapper over a SimpleLayerBuilder, providing a thread-safe sharable interface.
@@ -835,7 +835,7 @@ impl Store {
     }
 
     /// Set a callback that returns the current LRU archive cache usage in bytes.
-    pub fn with_lru_used_bytes<F: 'static + Fn() -> Option<usize> + Send + Sync>(mut self, f: F) -> Self {
+    pub fn with_lru_used_bytes<F: 'static + Fn() -> usize + Send + Sync>(mut self, f: F) -> Self {
         self.lru_used_bytes_fn = Some(Arc::new(f));
         self
     }
@@ -924,9 +924,9 @@ impl Store {
         self.layer_store.layer_cache_memory_bytes()
     }
 
-    /// Returns the current LRU archive cache usage in bytes, or None if unavailable.
+    /// Returns the current LRU archive cache usage in bytes, or None if no LRU backend.
     pub fn lru_cache_used_bytes(&self) -> Option<usize> {
-        self.lru_used_bytes_fn.as_ref().and_then(|f| f())
+        self.lru_used_bytes_fn.as_ref().map(|f| f())
     }
 
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.

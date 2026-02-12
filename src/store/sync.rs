@@ -621,7 +621,7 @@ impl SyncStore {
         self.inner.layer_cache_memory_bytes()
     }
 
-    /// Returns the current LRU archive cache usage in bytes, or None if unavailable.
+    /// Returns the current LRU archive cache usage in bytes, or None if no LRU backend.
     pub fn lru_cache_used_bytes(&self) -> Option<usize> {
         self.inner.lru_cache_used_bytes()
     }
