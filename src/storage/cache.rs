@@ -24,6 +24,12 @@ pub trait LayerCache: 'static + Send + Sync {
     fn cleanup_stale_entries(&self) -> usize {
         0
     }
+
+    /// Returns bytes of backing data: (total_bytes, live_bytes, dead_bytes).
+    /// Default implementation returns (0, 0, 0).
+    fn cache_memory_bytes(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
 }
 
 pub struct NoCache;
@@ -86,6 +92,25 @@ impl LockingHashMapLayerCache {
         cache.retain(|_, weak| weak.strong_count() > 0);
         let after = cache.len();
         before - after
+    }
+
+    /// Returns (total_bytes, live_bytes, dead_bytes) of stored_size() across cache entries.
+    pub fn memory_bytes(&self) -> (usize, usize, usize) {
+        let cache = self
+            .cache
+            .read()
+            .expect("rwlock read should always succeed, but got poisoned");
+        let mut live = 0usize;
+        let mut dead = 0usize;
+        for w in cache.values() {
+            if let Some(layer) = w.upgrade() {
+                live += layer.stored_size();
+            } else {
+                // Dead entries have no accessible size, count as 0
+                dead += 0;
+            }
+        }
+        (live + dead, live, dead)
     }
 }
 
@@ -153,6 +178,10 @@ impl LayerCache for LockingHashMapLayerCache {
     fn cleanup_stale_entries(&self) -> usize {
         self.cleanup_stale()
     }
+
+    fn cache_memory_bytes(&self) -> (usize, usize, usize) {
+        self.memory_bytes()
+    }
 }
 
 #[derive(Clone)]
@@ -181,6 +210,11 @@ impl CachedLayerStore {
     /// Remove stale entries from the cache. Returns number of entries removed.
     pub fn cleanup_stale_entries(&self) -> usize {
         self.cache.cleanup_stale_entries()
+    }
+
+    /// Returns bytes of backing data: (total_bytes, live_bytes, dead_bytes).
+    pub fn cache_memory_bytes(&self) -> (usize, usize, usize) {
+        self.cache.cache_memory_bytes()
     }
 }
 
@@ -645,6 +679,10 @@ impl LayerStore for CachedLayerStore {
 
     fn cleanup_layer_cache(&self) -> usize {
         self.cache.cleanup_stale_entries()
+    }
+
+    fn layer_cache_memory_bytes(&self) -> (usize, usize, usize) {
+        self.cache.cache_memory_bytes()
     }
 }
 

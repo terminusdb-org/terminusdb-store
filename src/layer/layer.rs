@@ -163,6 +163,12 @@ pub trait Layer: Send + Sync {
     }
 
     fn single_triple_sp(&self, subject: u64, predicate: u64) -> Option<IdTriple>;
+
+    /// Returns the byte size of the backing data for this layer only (not parents).
+    /// Default returns 0 for layers that don't track this.
+    fn stored_size(&self) -> usize {
+        0
+    }
 }
 
 pub struct LayerCounts {

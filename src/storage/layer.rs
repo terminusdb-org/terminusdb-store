@@ -363,6 +363,12 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         0
     }
 
+    /// Returns bytes of backing data: (total_bytes, live_bytes, dead_bytes).
+    /// Default implementation returns (0, 0, 0) for stores without caching.
+    fn layer_cache_memory_bytes(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
     /// Default implementation does nothing for stores without caching.
     fn invalidate(&self, _name: [u32; 5]) {}
