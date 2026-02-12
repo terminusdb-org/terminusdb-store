@@ -393,6 +393,23 @@ impl<M, D> LruArchiveBackend<M, D> {
     fn limit_bytes(&self) -> usize {
         self.limit * 1024 * 1024
     }
+
+    /// Returns the current bytes stored in the LRU cache (best-effort, non-blocking).
+    /// Returns None if the lock is contended (no value available).
+    pub fn used_bytes(&self) -> Option<usize> {
+        match self.cache.try_lock() {
+            Ok(cache) => Some(
+                cache
+                    .iter()
+                    .map(|(_, entry)| match entry {
+                        CacheEntry::Resolved(bytes) => bytes.len(),
+                        _ => 0,
+                    })
+                    .sum(),
+            ),
+            Err(_) => None,
+        }
+    }
 }
 
 impl<M: ArchiveMetadataBackend, D: ArchiveBackend> LruArchiveBackend<M, D> {

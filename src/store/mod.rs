@@ -23,6 +23,7 @@ use rayon::prelude::*;
 pub struct Store {
     label_store: Arc<dyn LabelStore>,
     layer_store: Arc<dyn LayerStore>,
+    lru_used_bytes_fn: Option<Arc<dyn Fn() -> Option<usize> + Send + Sync>>,
 }
 
 /// A wrapper over a SimpleLayerBuilder, providing a thread-safe sharable interface.
@@ -829,7 +830,14 @@ impl Store {
         Store {
             label_store: Arc::new(label_store),
             layer_store: Arc::new(layer_store),
+            lru_used_bytes_fn: None,
         }
+    }
+
+    /// Set a callback that returns the current LRU archive cache usage in bytes.
+    pub fn with_lru_used_bytes<F: 'static + Fn() -> Option<usize> + Send + Sync>(mut self, f: F) -> Self {
+        self.lru_used_bytes_fn = Some(Arc::new(f));
+        self
     }
 
     /// Create a new database with the given name.
@@ -911,6 +919,16 @@ impl Store {
         self.layer_store.cleanup_layer_cache()
     }
 
+    /// Returns bytes of backing data: (total_bytes, live_bytes, dead_bytes).
+    pub fn layer_cache_memory_bytes(&self) -> (usize, usize, usize) {
+        self.layer_store.layer_cache_memory_bytes()
+    }
+
+    /// Returns the current LRU archive cache usage in bytes, or None if unavailable.
+    pub fn lru_cache_used_bytes(&self) -> Option<usize> {
+        self.lru_used_bytes_fn.as_ref().and_then(|f| f())
+    }
+
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
     pub fn invalidate_layer(&self, name: [u32; 5]) {
         self.layer_store.invalidate(name);
@@ -940,6 +958,7 @@ pub fn open_archive_store<P: Into<PathBuf>>(path: P, cache_size: usize) -> Store
         directory_archive_backend,
         cache_size,
     );
+    let lru_ref = archive_backend.clone();
     Store::new(
         DirectoryLabelStore::new(p),
         CachedLayerStore::new(
@@ -947,6 +966,7 @@ pub fn open_archive_store<P: Into<PathBuf>>(path: P, cache_size: usize) -> Store
             LockingHashMapLayerCache::new(),
         ),
     )
+    .with_lru_used_bytes(move || lru_ref.used_bytes())
 }
 
 /// Open a store that stores its data in the given directory as archive files.

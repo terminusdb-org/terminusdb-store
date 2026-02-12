@@ -218,6 +218,15 @@ impl InternalLayer {
         }
     }
 
+    /// Returns the byte size of this layer's own backing data (not parents).
+    pub fn stored_size(&self) -> usize {
+        match self {
+            Base(base) => base.stored_size,
+            Child(child) => child.stored_size,
+            Rollup(rollup) => rollup.internal.stored_size(),
+        }
+    }
+
     pub fn predicate_dict_get(&self, id: usize) -> Option<String> {
         self.predicate_dictionary().get(id)
     }
@@ -882,6 +891,10 @@ impl Layer for InternalLayer {
                 .seek_object(object)
                 .take_while(move |t| t.object == object),
         )
+    }
+
+    fn stored_size(&self) -> usize {
+        InternalLayer::stored_size(self)
     }
 
     fn single_triple_sp(&self, subject: u64, predicate: u64) -> Option<IdTriple> {

@@ -616,6 +616,16 @@ impl SyncStore {
         self.inner.cleanup_layer_cache()
     }
 
+    /// Returns bytes of backing data: (total_bytes, live_bytes, dead_bytes).
+    pub fn layer_cache_memory_bytes(&self) -> (usize, usize, usize) {
+        self.inner.layer_cache_memory_bytes()
+    }
+
+    /// Returns the current LRU archive cache usage in bytes, or None if unavailable.
+    pub fn lru_cache_used_bytes(&self) -> Option<usize> {
+        self.inner.lru_cache_used_bytes()
+    }
+
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
     pub fn invalidate_layer(&self, name: [u32; 5]) {
         self.inner.invalidate_layer(name);
