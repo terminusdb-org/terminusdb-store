@@ -10,7 +10,10 @@ use std::{
     ops::Range,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
     task::Poll,
 };
 
@@ -356,7 +359,7 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
 pub struct LruArchiveBackend<M, D> {
     cache: Arc<tokio::sync::Mutex<LruCache<[u32; 5], CacheEntry>>>,
     limit: usize,
-    current: usize,
+    current: Arc<AtomicUsize>,
     metadata_origin: M,
     data_origin: D,
 }
@@ -384,7 +387,7 @@ impl<M, D> LruArchiveBackend<M, D> {
         Self {
             cache,
             limit,
-            current: 0,
+            current: Arc::new(AtomicUsize::new(0)),
             metadata_origin,
             data_origin,
         }
@@ -394,21 +397,9 @@ impl<M, D> LruArchiveBackend<M, D> {
         self.limit * 1024 * 1024
     }
 
-    /// Returns the current bytes stored in the LRU cache (best-effort, non-blocking).
-    /// Returns None if the lock is contended (no value available).
-    pub fn used_bytes(&self) -> Option<usize> {
-        match self.cache.try_lock() {
-            Ok(cache) => Some(
-                cache
-                    .iter()
-                    .map(|(_, entry)| match entry {
-                        CacheEntry::Resolved(bytes) => bytes.len(),
-                        _ => 0,
-                    })
-                    .sum(),
-            ),
-            Err(_) => None,
-        }
+    /// Returns the current bytes stored in the LRU cache.
+    pub fn used_bytes(&self) -> usize {
+        self.current.load(Ordering::Relaxed)
     }
 }
 
@@ -419,7 +410,11 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> LruArchiveBackend<M, D> {
     }
 }
 
-fn ensure_additional_cache_space(cache: &mut LruCache<[u32; 5], CacheEntry>, mut required: usize) {
+fn ensure_additional_cache_space(
+    cache: &mut LruCache<[u32; 5], CacheEntry>,
+    current: &AtomicUsize,
+    mut required: usize,
+) {
     if required == 0 {
         return;
     }
@@ -440,6 +435,7 @@ fn ensure_additional_cache_space(cache: &mut LruCache<[u32; 5], CacheEntry>, mut
             .expect("cache is empty but stored entries were expected")
             .1;
         if let CacheEntry::Resolved(entry) = entry {
+            current.fetch_sub(entry.len(), Ordering::Relaxed);
             if entry.len() >= required {
                 // done!
                 return;
@@ -456,7 +452,7 @@ fn ensure_additional_cache_space(cache: &mut LruCache<[u32; 5], CacheEntry>, mut
 fn ensure_enough_cache_space(
     cache: &mut LruCache<[u32; 5], CacheEntry>,
     limit: usize,
-    current: usize,
+    current: &AtomicUsize,
     required: usize,
 ) -> bool {
     if required > limit {
@@ -464,17 +460,25 @@ fn ensure_enough_cache_space(
         return false;
     }
 
-    let remaining = limit - current;
+    let cur = current.load(Ordering::Relaxed);
+    let remaining = limit.saturating_sub(cur);
     if remaining < required {
-        // we need to clean up some cache spacew to fit this entry
-        ensure_additional_cache_space(cache, required - remaining);
+        // we need to clean up some cache space to fit this entry
+        ensure_additional_cache_space(cache, current, required - remaining);
     }
 
     true
 }
 
-fn drop_from_cache(cache: &mut LruCache<[u32; 5], CacheEntry>, id: [u32; 5]) {
+fn drop_from_cache(
+    cache: &mut LruCache<[u32; 5], CacheEntry>,
+    id: [u32; 5],
+    current: &AtomicUsize,
+) {
     assert!(cache.contains(&id));
+    if let Some((_, CacheEntry::Resolved(bytes))) = cache.peek_lru().filter(|(k, _)| **k == id) {
+        current.fetch_sub(bytes.len(), Ordering::Relaxed);
+    }
     cache.demote(&id);
     cache.pop_lru();
 }
@@ -516,21 +520,22 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
                         if ensure_enough_cache_space(
                             &mut *cache,
                             self.limit_bytes(),
-                            self.current,
+                            &self.current,
                             bytes.len(),
                         ) {
                             let cached = cache
                                 .get_mut(&id)
                                 .expect("layer resolving entry not found in cache");
                             *cached = CacheEntry::Resolved(bytes.clone());
+                            self.current.fetch_add(bytes.len(), Ordering::Relaxed);
                         } else {
                             // this entry is uncachable. Just remove the resolving entry
-                            drop_from_cache(&mut *cache, id);
+                            drop_from_cache(&mut *cache, id, &self.current);
                         }
                         Ok(bytes)
                     }
                     Err(e) => {
-                        drop_from_cache(&mut *cache, id);
+                        drop_from_cache(&mut *cache, id, &self.current);
 
                         Err(e)
                     }
@@ -556,8 +561,14 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
     async fn store_layer_file(&self, id: [u32; 5], bytes: Bytes) -> io::Result<()> {
         self.data_origin.store_layer_file(id, bytes.clone()).await?;
 
+        let len = bytes.len();
         let mut cache = self.cache.lock().await;
-        cache.get_or_insert(id, move || CacheEntry::Resolved(bytes));
+        if !cache.contains(&id) {
+            if ensure_enough_cache_space(&mut *cache, self.limit_bytes(), &self.current, len) {
+                cache.put(id, CacheEntry::Resolved(bytes));
+                self.current.fetch_add(len, Ordering::Relaxed);
+            }
+        }
 
         Ok(())
     }
