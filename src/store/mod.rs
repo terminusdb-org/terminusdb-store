@@ -24,6 +24,7 @@ pub struct Store {
     label_store: Arc<dyn LabelStore>,
     layer_store: Arc<dyn LayerStore>,
     lru_used_bytes_fn: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    lru_evict_fn: Option<Arc<dyn Fn(f64) + Send + Sync>>,
 }
 
 /// A wrapper over a SimpleLayerBuilder, providing a thread-safe sharable interface.
@@ -831,12 +832,19 @@ impl Store {
             label_store: Arc::new(label_store),
             layer_store: Arc::new(layer_store),
             lru_used_bytes_fn: None,
+            lru_evict_fn: None,
         }
     }
 
     /// Set a callback that returns the current LRU archive cache usage in bytes.
     pub fn with_lru_used_bytes<F: 'static + Fn() -> usize + Send + Sync>(mut self, f: F) -> Self {
         self.lru_used_bytes_fn = Some(Arc::new(f));
+        self
+    }
+
+    /// Set a callback that evicts LRU cache entries to a target fraction.
+    pub fn with_lru_evict<F: 'static + Fn(f64) + Send + Sync>(mut self, f: F) -> Self {
+        self.lru_evict_fn = Some(Arc::new(f));
         self
     }
 
@@ -929,6 +937,15 @@ impl Store {
         self.lru_used_bytes_fn.as_ref().map(|f| f())
     }
 
+    /// Evict LRU cache entries until usage is at or below the given
+    /// fraction of the configured limit.  Does nothing if no LRU
+    /// backend is configured.
+    pub fn evict_lru_cache(&self, target_fraction: f64) {
+        if let Some(f) = &self.lru_evict_fn {
+            f(target_fraction)
+        }
+    }
+
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
     pub fn invalidate_layer(&self, name: [u32; 5]) {
         self.layer_store.invalidate(name);
@@ -959,6 +976,7 @@ pub fn open_archive_store<P: Into<PathBuf>>(path: P, cache_size: usize) -> Store
         cache_size,
     );
     let lru_ref = archive_backend.clone();
+    let lru_evict_ref = archive_backend.clone();
     Store::new(
         DirectoryLabelStore::new(p),
         CachedLayerStore::new(
@@ -967,6 +985,7 @@ pub fn open_archive_store<P: Into<PathBuf>>(path: P, cache_size: usize) -> Store
         ),
     )
     .with_lru_used_bytes(move || lru_ref.used_bytes())
+    .with_lru_evict(move |fraction| lru_evict_ref.evict_to_target(fraction))
 }
 
 /// Open a store that stores its data in the given directory as archive files.

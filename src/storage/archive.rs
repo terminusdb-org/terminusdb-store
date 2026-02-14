@@ -401,6 +401,34 @@ impl<M, D> LruArchiveBackend<M, D> {
     pub fn used_bytes(&self) -> usize {
         self.current.load(Ordering::Relaxed)
     }
+
+    /// Returns the configured LRU cache limit in bytes.
+    pub fn limit_bytes_total(&self) -> usize {
+        self.limit_bytes()
+    }
+
+    /// Evict LRU cache entries until usage is at or below
+    /// `target_fraction` of the configured limit (e.g. 0.75 keeps 25%
+    /// free).  Intended to be called post-commit so that subsequent
+    /// layer loads find free space without needing inline eviction.
+    ///
+    /// This method uses `blocking_lock` and must NOT be called from
+    /// within a tokio async context.
+    pub fn evict_to_target(&self, target_fraction: f64) {
+        let limit = self.limit_bytes();
+        if limit == 0 {
+            return;
+        }
+        let target = (limit as f64 * target_fraction) as usize;
+        let current = self.current.load(Ordering::Relaxed);
+        if current > target {
+            let mut cache = self.cache.blocking_lock();
+            let current = self.current.load(Ordering::Relaxed);
+            if current > target {
+                ensure_additional_cache_space(&mut cache, &self.current, current - target);
+            }
+        }
+    }
 }
 
 impl<M: ArchiveMetadataBackend, D: ArchiveBackend> LruArchiveBackend<M, D> {
