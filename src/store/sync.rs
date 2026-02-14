@@ -626,6 +626,13 @@ impl SyncStore {
         self.inner.lru_cache_used_bytes()
     }
 
+    /// Evict LRU cache entries until usage is at or below the given
+    /// fraction of the configured limit.  Does nothing if no LRU
+    /// backend is configured.
+    pub fn evict_lru_cache(&self, target_fraction: f64) {
+        self.inner.evict_lru_cache(target_fraction)
+    }
+
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
     pub fn invalidate_layer(&self, name: [u32; 5]) {
         self.inner.invalidate_layer(name);
