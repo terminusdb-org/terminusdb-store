@@ -358,6 +358,8 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
 #[derive(Clone)]
 pub struct LruArchiveBackend<M, D> {
     cache: Arc<tokio::sync::Mutex<LruCache<[u32; 5], CacheEntry>>>,
+    #[cfg(feature = "rollup_metadata_experimental")]
+    rollup_cache: Arc<std::sync::RwLock<HashMap<[u32; 5], Option<[u32; 5]>>>>,
     limit: usize,
     current: Arc<AtomicUsize>,
     metadata_origin: M,
@@ -386,6 +388,8 @@ impl<M, D> LruArchiveBackend<M, D> {
 
         Self {
             cache,
+            #[cfg(feature = "rollup_metadata_experimental")]
+            rollup_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             limit,
             current: Arc::new(AtomicUsize::new(0)),
             metadata_origin,
@@ -681,10 +685,26 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         }
     }
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
-        self.metadata_origin.get_rollup(id).await
+        #[cfg(feature = "rollup_metadata_experimental")]
+        {
+            if let Some(cached) = self.rollup_cache.read().unwrap().get(&id) {
+                return Ok(*cached);
+            }
+        }
+        let result = self.metadata_origin.get_rollup(id).await?;
+        #[cfg(feature = "rollup_metadata_experimental")]
+        {
+            self.rollup_cache.write().unwrap().insert(id, result);
+        }
+        Ok(result)
     }
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
-        self.metadata_origin.set_rollup(id, rollup).await
+        self.metadata_origin.set_rollup(id, rollup).await?;
+        #[cfg(feature = "rollup_metadata_experimental")]
+        {
+            self.rollup_cache.write().unwrap().insert(id, Some(rollup));
+        }
+        Ok(())
     }
 
     async fn get_parent(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
@@ -1586,5 +1606,287 @@ mod tests {
         }
 
         assert!(!header.is_present(LayerFileEnum::NodeDictionaryOffsets));
+    }
+
+    #[cfg(feature = "rollup_metadata_experimental")]
+    mod rollup_metadata_cache_tests {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        /// Mock metadata backend that tracks get_rollup call counts.
+        #[derive(Clone)]
+        struct MockMetadataBackend {
+            rollup_map: Arc<std::sync::RwLock<HashMap<[u32; 5], [u32; 5]>>>,
+            get_rollup_calls: Arc<AtomicUsize>,
+        }
+
+        impl MockMetadataBackend {
+            fn new() -> Self {
+                Self {
+                    rollup_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    get_rollup_calls: Arc::new(AtomicUsize::new(0)),
+                }
+            }
+
+            fn get_rollup_call_count(&self) -> usize {
+                self.get_rollup_calls.load(Ordering::Relaxed)
+            }
+        }
+
+        #[async_trait]
+        impl ArchiveMetadataBackend for MockMetadataBackend {
+            async fn get_layer_names(&self) -> io::Result<Vec<[u32; 5]>> {
+                Ok(vec![])
+            }
+            async fn layer_exists(&self, _id: [u32; 5]) -> io::Result<bool> {
+                Ok(true)
+            }
+            async fn layer_size(&self, _id: [u32; 5]) -> io::Result<u64> {
+                Ok(100)
+            }
+            async fn layer_file_exists(
+                &self,
+                _id: [u32; 5],
+                _file_type: LayerFileEnum,
+            ) -> io::Result<bool> {
+                Ok(false)
+            }
+            async fn get_layer_structure_size(
+                &self,
+                _id: [u32; 5],
+                _file_type: LayerFileEnum,
+            ) -> io::Result<usize> {
+                Ok(0)
+            }
+            async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+                self.get_rollup_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(self.rollup_map.read().unwrap().get(&id).copied())
+            }
+            async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
+                self.rollup_map.write().unwrap().insert(id, rollup);
+                Ok(())
+            }
+            async fn get_parent(&self, _id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+                Ok(None)
+            }
+        }
+
+        /// Minimal mock data backend (not used by rollup metadata tests).
+        #[derive(Clone)]
+        struct MockDataBackend;
+
+        #[async_trait]
+        impl ArchiveBackend for MockDataBackend {
+            type Read = BytesAsyncReader;
+            async fn get_layer_bytes(&self, _id: [u32; 5]) -> io::Result<Bytes> {
+                Err(io::Error::new(io::ErrorKind::NotFound, "mock"))
+            }
+            async fn get_layer_structure_bytes(
+                &self,
+                _id: [u32; 5],
+                _file_type: LayerFileEnum,
+            ) -> io::Result<Option<Bytes>> {
+                Ok(None)
+            }
+            async fn store_layer_file(&self, _id: [u32; 5], _bytes: Bytes) -> io::Result<()> {
+                Ok(())
+            }
+            async fn read_layer_structure_bytes_from(
+                &self,
+                _id: [u32; 5],
+                _file_type: LayerFileEnum,
+                _read_from: usize,
+            ) -> io::Result<Self::Read> {
+                Err(io::Error::new(io::ErrorKind::NotFound, "mock"))
+            }
+        }
+
+        fn test_layer_id(n: u32) -> [u32; 5] {
+            [n, 0, 0, 0, 0]
+        }
+
+        fn make_lru_backend(
+            mock: MockMetadataBackend,
+        ) -> LruArchiveBackend<MockMetadataBackend, MockDataBackend> {
+            LruArchiveBackend::new(mock, MockDataBackend, 512)
+        }
+
+        #[tokio::test]
+        async fn get_rollup_caches_result_on_second_call() {
+            let mock = MockMetadataBackend::new();
+            let layer_id = test_layer_id(1);
+            let rollup_id = test_layer_id(99);
+            mock.rollup_map.write().unwrap().insert(layer_id, rollup_id);
+
+            let backend = make_lru_backend(mock.clone());
+
+            let result1 = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result1, Some(rollup_id));
+            assert_eq!(mock.get_rollup_call_count(), 1);
+
+            let result2 = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result2, Some(rollup_id));
+            assert_eq!(
+                mock.get_rollup_call_count(),
+                1,
+                "second call should hit cache, not disk"
+            );
+        }
+
+        #[tokio::test]
+        async fn get_rollup_caches_none_for_layers_without_rollup() {
+            let mock = MockMetadataBackend::new();
+            let layer_id = test_layer_id(2);
+
+            let backend = make_lru_backend(mock.clone());
+
+            let result1 = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result1, None);
+            assert_eq!(mock.get_rollup_call_count(), 1);
+
+            let result2 = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result2, None);
+            assert_eq!(
+                mock.get_rollup_call_count(),
+                1,
+                "negative result should be cached too"
+            );
+        }
+
+        #[tokio::test]
+        async fn set_rollup_updates_cache() {
+            let mock = MockMetadataBackend::new();
+            let layer_id = test_layer_id(3);
+            let rollup_id = test_layer_id(100);
+
+            let backend = make_lru_backend(mock.clone());
+
+            let result1 = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result1, None);
+            assert_eq!(mock.get_rollup_call_count(), 1);
+
+            backend.set_rollup(layer_id, rollup_id).await.unwrap();
+
+            let result2 = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result2, Some(rollup_id));
+            assert_eq!(
+                mock.get_rollup_call_count(),
+                1,
+                "get_rollup after set_rollup should use updated cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn set_rollup_overwrites_previous_cached_value() {
+            let mock = MockMetadataBackend::new();
+            let layer_id = test_layer_id(4);
+            let rollup_v1 = test_layer_id(200);
+            let rollup_v2 = test_layer_id(201);
+            mock.rollup_map.write().unwrap().insert(layer_id, rollup_v1);
+
+            let backend = make_lru_backend(mock.clone());
+
+            let result1 = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result1, Some(rollup_v1));
+
+            backend.set_rollup(layer_id, rollup_v2).await.unwrap();
+
+            let result2 = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result2, Some(rollup_v2));
+            assert_eq!(
+                mock.get_rollup_call_count(),
+                1,
+                "only the initial get_rollup should hit the mock backend"
+            );
+        }
+
+        #[tokio::test]
+        async fn cloned_backend_shares_rollup_cache() {
+            let mock = MockMetadataBackend::new();
+            let layer_id = test_layer_id(5);
+            let rollup_id = test_layer_id(300);
+            mock.rollup_map.write().unwrap().insert(layer_id, rollup_id);
+
+            let backend1 = make_lru_backend(mock.clone());
+            let backend2 = backend1.clone();
+
+            let result1 = backend1.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result1, Some(rollup_id));
+            assert_eq!(mock.get_rollup_call_count(), 1);
+
+            let result2 = backend2.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result2, Some(rollup_id));
+            assert_eq!(
+                mock.get_rollup_call_count(),
+                1,
+                "cloned backend should share the rollup cache"
+            );
+        }
+
+        /// Documents the interaction between CachedLayerStore::register_rollup
+        /// and LruArchiveBackend's rollup metadata cache.
+        ///
+        /// When CachedLayerStore::register_rollup is called, it:
+        ///   1. Delegates to ArchiveLayerStore::register_rollup which calls
+        ///      write_rollup_file → set_rollup on LruArchiveBackend, updating
+        ///      both disk and the rollup metadata cache.
+        ///   2. Invalidates the layer object cache (LockingHashMapLayerCache)
+        ///      for the entire parent chain so stale InternalLayer objects are
+        ///      evicted.
+        ///
+        /// When get_layer is subsequently called (after invalidation), it must
+        /// call get_rollup to check whether the layer has a rollup. With the
+        /// rollup metadata cache, this lookup is served from memory — no disk
+        /// I/O for rollup metadata.
+        ///
+        /// This test models that exact flow and verifies that the rollup
+        /// metadata cache survives layer object cache invalidation.
+        #[tokio::test]
+        async fn register_rollup_flow_caches_metadata_for_layer_rediscovery() {
+            let mock = MockMetadataBackend::new();
+            let layer_id = test_layer_id(10);
+            let rollup_id = test_layer_id(500);
+
+            let backend = make_lru_backend(mock.clone());
+
+            // Phase 1: Initial layer load — no rollup exists yet.
+            // get_layer_with_cache calls get_rollup to check for rollup metadata.
+            let result = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result, None);
+            assert_eq!(mock.get_rollup_call_count(), 1);
+
+            // Phase 2: register_rollup writes the rollup via set_rollup.
+            // This updates the underlying storage AND the rollup metadata cache.
+            backend.set_rollup(layer_id, rollup_id).await.unwrap();
+
+            // Phase 3: CachedLayerStore invalidates the layer object cache
+            // (LockingHashMapLayerCache). This is external to LruArchiveBackend
+            // — it only evicts InternalLayer objects, not rollup metadata.
+            // The rollup metadata cache in LruArchiveBackend is NOT affected.
+
+            // Phase 4: get_layer is called again after layer cache invalidation.
+            // It needs get_rollup to rediscover the rollup. The rollup metadata
+            // cache serves the result without any backend call.
+            let result = backend.get_rollup(layer_id).await.unwrap();
+            assert_eq!(result, Some(rollup_id));
+            assert_eq!(
+                mock.get_rollup_call_count(),
+                1,
+                "after register_rollup + layer cache invalidation, get_rollup \
+                 should serve from the rollup metadata cache without hitting \
+                 the underlying backend"
+            );
+
+            // Verify a different layer still hits the backend (guard against
+            // false positives from a cache that returns stale data for all ids).
+            let other_layer = test_layer_id(11);
+            let _ = backend.get_rollup(other_layer).await.unwrap();
+            assert_eq!(
+                mock.get_rollup_call_count(),
+                2,
+                "an uncached layer should still hit the underlying backend"
+            );
+        }
     }
 }
