@@ -440,6 +440,14 @@ impl Layer for SyncStoreLayer {
         self.inner.triples_o(object)
     }
 
+    fn triples_value_range(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
+        self.inner.triples_value_range(low, high)
+    }
+
     fn clone_boxed(&self) -> Box<dyn Layer> {
         Box::new(self.clone())
     }
