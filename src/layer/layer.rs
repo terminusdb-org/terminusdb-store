@@ -124,6 +124,17 @@ pub trait Layer: Send + Sync {
         high: &TypedDictEntry,
     ) -> Box<dyn Iterator<Item = IdTriple> + Send>;
 
+    /// Iterator over all triples whose object value falls in the half-open range [low, high),
+    /// yielding results in reverse (descending) object order.
+    ///
+    /// Both bounds must have the same Datatype. The range is inclusive on low and exclusive on high.
+    /// Returns an empty iterator if the type segment doesn't exist or if the range is empty.
+    fn triples_value_range_rev(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> Box<dyn Iterator<Item = IdTriple> + Send>;
+
     /// Convert all known strings in the given string triple to ids.
     fn value_triple_to_partially_resolved(&self, triple: ValueTriple) -> PartiallyResolvedTriple {
         PartiallyResolvedTriple {
