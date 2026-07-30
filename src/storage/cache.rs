@@ -1,7 +1,7 @@
 use super::layer::*;
 use crate::layer::*;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, RwLock, Weak};
@@ -29,6 +29,23 @@ pub trait LayerCache: 'static + Send + Sync {
     /// Default implementation returns (0, 0, 0).
     fn cache_memory_bytes(&self) -> (usize, usize, usize) {
         (0, 0, 0)
+    }
+
+    /// Returns all layer IDs currently in the cache.
+    /// Default implementation returns an empty vector.
+    fn cached_layer_ids(&self) -> Vec<[u32; 5]> {
+        Vec::new()
+    }
+
+    /// Associate a cached layer with a database name for bulk invalidation.
+    /// Default implementation does nothing.
+    fn associate_with_database(&self, _name: [u32; 5], _database: &str) {}
+
+    /// Invalidate all cached layers associated with a database.
+    /// Returns the number of layers invalidated.
+    /// Default implementation returns 0.
+    fn invalidate_database(&self, _database: &str) -> usize {
+        0
     }
 }
 
@@ -60,6 +77,7 @@ const DEAD_ENTRY_PERCENTAGE_THRESHOLD: usize = 20;
 #[derive(Default)]
 pub struct LockingHashMapLayerCache {
     cache: RwLock<HashMap<[u32; 5], Weak<InternalLayer>>>,
+    db_index: RwLock<HashMap<String, HashSet<[u32; 5]>>>,
 }
 
 impl LockingHashMapLayerCache {
@@ -162,7 +180,6 @@ impl LayerCache for LockingHashMapLayerCache {
     }
 
     fn invalidate(&self, name: [u32; 5]) {
-        // the dumb way - we just delete the thing from cache forcing a refresh
         let mut cache = self
             .cache
             .write()
@@ -181,6 +198,45 @@ impl LayerCache for LockingHashMapLayerCache {
 
     fn cache_memory_bytes(&self) -> (usize, usize, usize) {
         self.memory_bytes()
+    }
+
+    fn cached_layer_ids(&self) -> Vec<[u32; 5]> {
+        let cache = self
+            .cache
+            .read()
+            .expect("rwlock read should always succeed, but got poisoned");
+        cache.keys().copied().collect()
+    }
+
+    fn associate_with_database(&self, name: [u32; 5], database: &str) {
+        let mut index = self
+            .db_index
+            .write()
+            .expect("rwlock write should always succeed");
+        index
+            .entry(database.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(name);
+    }
+
+    fn invalidate_database(&self, database: &str) -> usize {
+        let ids = {
+            let mut index = self
+                .db_index
+                .write()
+                .expect("rwlock write should always succeed");
+            index.remove(database)
+        };
+        match ids {
+            Some(id_set) => {
+                let count = id_set.len();
+                for id in id_set {
+                    self.invalidate(id);
+                }
+                count
+            }
+            None => 0,
+        }
     }
 }
 
@@ -215,6 +271,17 @@ impl CachedLayerStore {
     /// Returns bytes of backing data: (total_bytes, live_bytes, dead_bytes).
     pub fn cache_memory_bytes(&self) -> (usize, usize, usize) {
         self.cache.cache_memory_bytes()
+    }
+
+    /// Associate a cached layer with a database name for bulk invalidation.
+    pub fn associate_with_database(&self, name: [u32; 5], database: &str) {
+        self.cache.associate_with_database(name, database);
+    }
+
+    /// Invalidate all cached layers associated with a database.
+    /// Returns the number of layers invalidated.
+    pub fn invalidate_database(&self, database: &str) -> usize {
+        self.cache.invalidate_database(database)
     }
 }
 
@@ -684,6 +751,22 @@ impl LayerStore for CachedLayerStore {
     fn layer_cache_memory_bytes(&self) -> (usize, usize, usize) {
         self.cache.cache_memory_bytes()
     }
+
+    fn cached_layer_ids(&self) -> Vec<[u32; 5]> {
+        self.cache.cached_layer_ids()
+    }
+
+    fn invalidate(&self, name: [u32; 5]) {
+        self.cache.invalidate(name);
+    }
+
+    fn associate_with_database(&self, name: [u32; 5], database: &str) {
+        self.cache.associate_with_database(name, database);
+    }
+
+    fn invalidate_database(&self, database: &str) -> usize {
+        self.cache.invalidate_database(database)
+    }
 }
 
 #[cfg(test)]
@@ -802,5 +885,64 @@ pub mod tests {
     fn retrieve_layer_stack_names_retrieves_correctly() {
         //let store = CachedLayerStore::new(MemoryLayerStore::new());
         //let builder = store.create_base_layer().wait().unwrap();
+    }
+
+    #[test]
+    fn associate_and_invalidate_database() {
+        let cache = LockingHashMapLayerCache::new();
+        let ids: [[u32; 5]; 3] = [
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10],
+            [11, 12, 13, 14, 15],
+        ];
+
+        for id in &ids {
+            cache.associate_with_database(*id, "admin|testdb");
+        }
+
+        let count = cache.invalidate_database("admin|testdb");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn invalidate_nonexistent_database() {
+        let cache = LockingHashMapLayerCache::new();
+        let count = cache.invalidate_database("admin|nonexistent");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn associate_multiple_databases() {
+        let cache = LockingHashMapLayerCache::new();
+
+        cache.associate_with_database([1, 2, 3, 4, 5], "admin|db1");
+        cache.associate_with_database([6, 7, 8, 9, 10], "admin|db1");
+        cache.associate_with_database([11, 12, 13, 14, 15], "admin|db2");
+        cache.associate_with_database([16, 17, 18, 19, 20], "admin|db2");
+
+        let count = cache.invalidate_database("admin|db1");
+        assert_eq!(count, 2);
+
+        // db2 associations should still be present
+        let count2 = cache.invalidate_database("admin|db2");
+        assert_eq!(count2, 2);
+    }
+
+    #[test]
+    fn invalidate_does_not_affect_unassociated() {
+        let cache = LockingHashMapLayerCache::new();
+
+        cache.associate_with_database([1, 2, 3, 4, 5], "admin|db1");
+        cache.associate_with_database([6, 7, 8, 9, 10], "admin|db1");
+
+        // Associate a different ID with a different database
+        cache.associate_with_database([11, 12, 13, 14, 15], "admin|db2");
+
+        let count = cache.invalidate_database("admin|db1");
+        assert_eq!(count, 2);
+
+        // db2 should still have its association
+        let count2 = cache.invalidate_database("admin|db2");
+        assert_eq!(count2, 1);
     }
 }

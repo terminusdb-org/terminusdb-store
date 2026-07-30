@@ -653,6 +653,22 @@ impl SyncStore {
     pub fn invalidate_layer(&self, name: [u32; 5]) {
         self.inner.invalidate_layer(name);
     }
+
+    /// Returns all layer IDs currently in the cache.
+    pub fn cached_layer_ids(&self) -> Vec<[u32; 5]> {
+        self.inner.cached_layer_ids()
+    }
+
+    /// Associate a cached layer with a database name for bulk invalidation.
+    pub fn associate_layer_with_database(&self, name: [u32; 5], database: &str) {
+        self.inner.associate_layer_with_database(name, database);
+    }
+
+    /// Invalidate all cached layers associated with a database.
+    /// Returns the number of layers invalidated.
+    pub fn invalidate_database_layers(&self, database: &str) -> usize {
+        self.inner.invalidate_database_layers(database)
+    }
 }
 
 /// Open a store that is entirely in memory.

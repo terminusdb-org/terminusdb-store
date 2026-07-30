@@ -966,6 +966,22 @@ impl Store {
     pub fn invalidate_layer(&self, name: [u32; 5]) {
         self.layer_store.invalidate(name);
     }
+
+    /// Returns all layer IDs currently in the cache.
+    pub fn cached_layer_ids(&self) -> Vec<[u32; 5]> {
+        self.layer_store.cached_layer_ids()
+    }
+
+    /// Associate a cached layer with a database name for bulk invalidation.
+    pub fn associate_layer_with_database(&self, name: [u32; 5], database: &str) {
+        self.layer_store.associate_with_database(name, database);
+    }
+
+    /// Invalidate all cached layers associated with a database.
+    /// Returns the number of layers invalidated.
+    pub fn invalidate_database_layers(&self, database: &str) -> usize {
+        self.layer_store.invalidate_database(database)
+    }
 }
 
 /// Open a store that is entirely in memory.

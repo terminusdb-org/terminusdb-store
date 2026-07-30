@@ -372,6 +372,23 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
     /// Default implementation does nothing for stores without caching.
     fn invalidate(&self, _name: [u32; 5]) {}
+
+    /// Returns all layer IDs currently in the cache.
+    /// Default implementation returns an empty vector for stores without caching.
+    fn cached_layer_ids(&self) -> Vec<[u32; 5]> {
+        Vec::new()
+    }
+
+    /// Associate a cached layer with a database name for bulk invalidation.
+    /// Default implementation does nothing for stores without caching.
+    fn associate_with_database(&self, _name: [u32; 5], _database: &str) {}
+
+    /// Invalidate all cached layers associated with a database.
+    /// Returns the number of layers invalidated.
+    /// Default implementation returns 0 for stores without caching.
+    fn invalidate_database(&self, _database: &str) -> usize {
+        0
+    }
 }
 
 #[async_trait]
