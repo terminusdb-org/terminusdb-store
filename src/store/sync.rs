@@ -620,26 +620,17 @@ impl SyncStore {
     /// After this operation, the specified layers will be retrievable
     /// from this store, provided they existed in the pack. specified
     /// layers that are not in the pack are silently ignored.
+    ///
+    /// Layers that already exist are not overwritten; instead their
+    /// files are verified to be identical to the pack contents, as
+    /// layer ids are random names and not content hashes. Returns the
+    /// list of layer ids that already existed with differing contents.
     pub fn import_layers(
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
-        task_sync(self.inner.layer_store.import_layers(pack, layer_ids))
-    }
-
-    /// Verify that the specified layers from the given pack are identical
-    /// to what is already in this store, returning the list of layer ids
-    /// whose pack contents differ from the stored layer.
-    ///
-    /// Specified layers that are not present in this store are silently
-    /// ignored, as they cannot be verified.
-    pub fn verify_pack_layers(
-        &self,
-        pack: &[u8],
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<Vec<[u32; 5]>> {
-        task_sync(self.inner.layer_store.verify_pack_layers(pack, layer_ids))
+        task_sync(self.inner.layer_store.import_layers(pack, layer_ids))
     }
 
     /// Returns cache statistics: (total_entries, live_entries, dead_entries)

@@ -30,23 +30,17 @@ pub trait Packable {
     /// After this operation, the specified layers will be retrievable
     /// from this store, provided they existed in the pack. specified
     /// layers that are not in the pack are silently ignored.
-    async fn import_layers(
-        &self,
-        pack: &[u8],
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()>;
-
-    /// Verify that the specified layers from the given pack are identical
-    /// to what is already in this store, returning the list of layer ids
-    /// whose pack contents differ from the stored layer.
+    /// Import the specified layers from the given pack.
     ///
-    /// Every file contained in the pack for a verified layer must exist
-    /// in this store with identical contents. Files that only exist in
+    /// Layers that do not yet exist in this store are created. Layers
+    /// that already exist are not overwritten; instead their files are
+    /// verified to be identical to the pack contents, as layer ids are
+    /// random names and not content hashes. Files that only exist in
     /// the store (such as rollups written after export) are ignored.
     ///
-    /// Specified layers that are not present in this store are silently
-    /// ignored, as they cannot be verified.
-    async fn verify_pack_layers(
+    /// Returns the list of layer ids that already existed with
+    /// differing contents.
+    async fn import_layers(
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
@@ -80,13 +74,22 @@ impl<T: PersistentLayerStore> Packable for T {
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         let mut layer_id_set = HashSet::new();
+        let mut existing_id_set = HashSet::new();
         for id in layer_ids {
-            layer_id_set.insert(name_to_string(id));
-            self.create_named_directory(id).await?;
+            let layer_id = name_to_string(id);
+            layer_id_set.insert(layer_id.clone());
+            // A layer that already exists is verified file by file
+            // against the pack contents instead of being overwritten.
+            if self.directory_exists(id).await? {
+                existing_id_set.insert(layer_id);
+            } else {
+                self.create_named_directory(id).await?;
+            }
         }
 
+        let mut mismatched = HashSet::new();
         let handle = tokio::runtime::Handle::current();
         tokio::task::block_in_place(|| {
             let cursor = io::Cursor::new(pack);
@@ -112,13 +115,18 @@ impl<T: PersistentLayerStore> Packable for T {
                     .to_owned();
 
                 // check if entry is prefixed with a layer id we are interested in
-                let layer_id = path.iter().next().and_then(|p| p.to_str()).unwrap_or("");
+                let layer_id = path
+                    .iter()
+                    .next()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("")
+                    .to_string();
 
-                if layer_id_set.contains(layer_id) {
+                if layer_id_set.contains(&layer_id) {
                     // this conversion should always work cause we are
                     // only able to match things that went through the
                     // conversion in the opposite direction.
-                    let layer_id_arr = string_to_name(layer_id).unwrap();
+                    let layer_id_arr = string_to_name(&layer_id).unwrap();
 
                     let header = entry.header();
                     if !header.entry_type().is_file() {
@@ -128,89 +136,38 @@ impl<T: PersistentLayerStore> Packable for T {
                     let mut content = Vec::with_capacity(header.size()? as usize);
                     entry.read_to_end(&mut content)?;
 
-                    handle.block_on(async move {
-                        let file = self.get_file(layer_id_arr, &file_name).await?;
-                        let mut writer = file.open_write().await?;
-                        writer.write_all(&content).await?;
-                        writer.flush().await?;
-                        writer.sync_all().await?;
+                    if existing_id_set.contains(&layer_id) {
+                        // verify this file against the stored layer
+                        let identical = handle.block_on(async {
+                            if !self.file_exists(layer_id_arr, &file_name).await? {
+                                return Ok::<_, io::Error>(false);
+                            }
+                            let file = self.get_file(layer_id_arr, &file_name).await?;
+                            let existing = file.map().await?;
+                            Ok(&*existing == content.as_slice())
+                        })?;
 
-                        Ok::<_, io::Error>(())
-                    })?;
-                }
-            }
+                        if !identical {
+                            mismatched.insert(layer_id_arr);
+                        }
+                    } else {
+                        handle.block_on(async move {
+                            let file = self.get_file(layer_id_arr, &file_name).await?;
+                            let mut writer = file.open_write().await?;
+                            writer.write_all(&content).await?;
+                            writer.flush().await?;
+                            writer.sync_all().await?;
 
-            for layer_id in layer_id_set {
-                let layer_id_arr = string_to_name(&layer_id).unwrap();
-                handle.block_on(self.finalize_layer(layer_id_arr))?;
-            }
-
-            Ok(())
-        })
-    }
-
-    async fn verify_pack_layers(
-        &self,
-        pack: &[u8],
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<Vec<[u32; 5]>> {
-        let mut layer_id_set = HashSet::new();
-        for id in layer_ids {
-            // only layers that already exist can be verified
-            if self.directory_exists(id).await? {
-                layer_id_set.insert(name_to_string(id));
-            }
-        }
-
-        let mut mismatched = HashSet::new();
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| {
-            let cursor = io::Cursor::new(pack);
-            let tar = GzDecoder::new(cursor);
-            let mut archive = Archive::new(tar);
-
-            for e in archive.entries()? {
-                let mut entry = e?;
-                let path = entry.path()?;
-                let os_file_name = path.file_name().unwrap();
-                let file_name = os_file_name
-                    .to_str()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "unexpected non-utf8 directory name",
-                        )
-                    })?
-                    .to_owned();
-
-                let layer_id = path.iter().next().and_then(|p| p.to_str()).unwrap_or("");
-
-                if !layer_id_set.contains(layer_id) {
-                    continue;
-                }
-
-                let layer_id_arr = string_to_name(layer_id).unwrap();
-
-                let header = entry.header();
-                if !header.entry_type().is_file() {
-                    continue;
-                }
-
-                let mut content = Vec::with_capacity(header.size()? as usize);
-                entry.read_to_end(&mut content)?;
-
-                let identical = handle.block_on(async {
-                    if !self.file_exists(layer_id_arr, &file_name).await? {
-                        return Ok::<_, io::Error>(false);
+                            Ok::<_, io::Error>(())
+                        })?;
                     }
-                    let file = self.get_file(layer_id_arr, &file_name).await?;
-                    let existing = file.map().await?;
-                    Ok(&*existing == content.as_slice())
-                })?;
-
-                if !identical {
-                    mismatched.insert(layer_id_arr);
                 }
+            }
+
+            // only layers that were actually created get finalized
+            for layer_id in layer_id_set.difference(&existing_id_set) {
+                let layer_id_arr = string_to_name(layer_id).unwrap();
+                handle.block_on(self.finalize_layer(layer_id_arr))?;
             }
 
             Ok::<_, io::Error>(())
@@ -405,16 +362,8 @@ impl Packable for CachedLayerStore {
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
-        self.inner.import_layers(pack, layer_ids).await
-    }
-
-    async fn verify_pack_layers(
-        &self,
-        pack: &[u8],
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<Vec<[u32; 5]>> {
-        self.inner.verify_pack_layers(pack, layer_ids).await
+        self.inner.import_layers(pack, layer_ids).await
     }
 }
 
@@ -478,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn verify_pack_layers_identical_and_unknown() {
+    async fn import_layers_verifies_identical() {
         let dir1 = tempdir().unwrap();
         let store1 = Arc::new(DirectoryLayerStore::new(dir1.path()));
         let dir2 = tempdir().unwrap();
@@ -495,32 +444,27 @@ mod tests {
             .await
             .unwrap();
 
-        // a layer that doesn't exist can't be verified and is ignored
+        // an unknown layer is imported without mismatches
         assert_eq!(
             Vec::<[u32; 5]>::new(),
             store2
-                .verify_pack_layers(&export, Box::new(vec![base_name].into_iter()))
+                .import_layers(&export, Box::new(vec![base_name].into_iter()))
                 .await
                 .unwrap()
         );
 
-        store2
-            .import_layers(&export, Box::new(vec![base_name].into_iter()))
-            .await
-            .unwrap();
-
-        // an identical layer verifies cleanly
+        // an identical layer verifies cleanly and is reused
         assert_eq!(
             Vec::<[u32; 5]>::new(),
             store2
-                .verify_pack_layers(&export, Box::new(vec![base_name].into_iter()))
+                .import_layers(&export, Box::new(vec![base_name].into_iter()))
                 .await
                 .unwrap()
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn verify_pack_layers_detects_mismatch() {
+    async fn import_layers_detects_mismatch() {
         let dir1 = tempdir().unwrap();
         let store1 = Arc::new(DirectoryLayerStore::new(dir1.path()));
         let dir2 = tempdir().unwrap();
@@ -545,9 +489,13 @@ mod tests {
         assert_eq!(
             vec![base_name],
             store2
-                .verify_pack_layers(&export, Box::new(vec![base_name].into_iter()))
+                .import_layers(&export, Box::new(vec![base_name].into_iter()))
                 .await
                 .unwrap()
         );
+
+        // the existing layer was not overwritten
+        let layer = store2.get_layer(base_name).await.unwrap().unwrap();
+        assert_eq!(0, layer.node_and_value_count());
     }
 }
