@@ -591,6 +591,13 @@ impl SyncStore {
         inner.map(SyncStoreLayerBuilder::wrap)
     }
 
+    /// Create an empty base layer with the given name.
+    ///
+    /// Fails if a layer with this name already exists.
+    pub fn create_named_base_layer(&self, name: [u32; 5]) -> io::Result<()> {
+        task_sync(self.inner.layer_store.create_base_layer_with_name(name))
+    }
+
     pub fn merge_base_layers(
         &self,
         layers: &[[u32; 5]],
@@ -613,11 +620,16 @@ impl SyncStore {
     /// After this operation, the specified layers will be retrievable
     /// from this store, provided they existed in the pack. specified
     /// layers that are not in the pack are silently ignored.
+    ///
+    /// Layers that already exist are not overwritten; instead their
+    /// files are verified to be identical to the pack contents, as
+    /// layer ids are random names and not content hashes. Returns the
+    /// list of layer ids that already existed with differing contents.
     pub fn import_layers(
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         task_sync(self.inner.layer_store.import_layers(pack, layer_ids))
     }
 

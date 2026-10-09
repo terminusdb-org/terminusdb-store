@@ -924,11 +924,16 @@ impl Store {
     /// After this operation, the specified layers will be retrievable
     /// from this store, provided they existed in the pack. specified
     /// layers that are not in the pack are silently ignored.
+    ///
+    /// Layers that already exist are not overwritten; instead their
+    /// files are verified to be identical to the pack contents, as
+    /// layer ids are random names and not content hashes. Returns the
+    /// list of layer ids that already existed with differing contents.
     pub async fn import_layers<'a>(
         &'a self,
         pack: &'a [u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         self.layer_store.import_layers(pack, layer_ids).await
     }
 

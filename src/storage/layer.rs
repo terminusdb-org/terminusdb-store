@@ -104,6 +104,11 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     async fn get_predicate_idmap(&self, name: [u32; 5]) -> io::Result<Option<IdMap>>;
 
     async fn create_base_layer(&self) -> io::Result<Box<dyn LayerBuilder>>;
+
+    /// Create an empty base layer with the given name.
+    ///
+    /// Fails if a layer with this name already exists.
+    async fn create_base_layer_with_name(&self, name: [u32; 5]) -> io::Result<()>;
     async fn create_child_layer_with_cache(
         &self,
         parent: [u32; 5],
@@ -1730,6 +1735,19 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         Ok(Box::new(SimpleLayerBuilder::new(dir_name, files)) as Box<dyn LayerBuilder>)
     }
 
+    async fn create_base_layer_with_name(&self, name: [u32; 5]) -> io::Result<()> {
+        if self.directory_exists(name).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("layer {} already exists", name_to_string(name)),
+            ));
+        }
+        let dir_name = self.create_named_directory(name).await?;
+        let files = self.base_layer_files(dir_name).await?;
+        SimpleLayerBuilder::new(dir_name, files).commit().await?;
+        self.finalize_layer(name).await
+    }
+
     async fn create_child_layer_with_cache(
         &self,
         parent: [u32; 5],
@@ -2802,6 +2820,42 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = DirectoryLayerStore::new(dir.path());
         base_layer_counts(&store, false).await.unwrap();
+    }
+
+    async fn base_layer_with_name<S: LayerStore>(store: &S) -> io::Result<()> {
+        let name = [1, 2, 3, 4, 5];
+        store.create_base_layer_with_name(name).await?;
+        // creating a layer with an existing name fails loudly
+        assert_eq!(
+            io::ErrorKind::AlreadyExists,
+            store
+                .create_base_layer_with_name(name)
+                .await
+                .unwrap_err()
+                .kind()
+        );
+
+        let layer = store.get_layer(name).await?.expect("layer should exist");
+        assert_eq!(0, layer.node_and_value_count());
+        assert_eq!(0, layer.predicate_count());
+        assert_eq!(0, store.triple_layer_addition_count(name).await?);
+        assert_eq!(0, store.triple_layer_removal_count(name).await?);
+        assert!(layer.parent_name().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_base_layer_with_name() {
+        let store = MemoryLayerStore::new();
+        base_layer_with_name(&store).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_base_layer_with_name() {
+        let dir = tempdir().unwrap();
+        let store = DirectoryLayerStore::new(dir.path());
+        base_layer_with_name(&store).await.unwrap();
     }
 
     async fn child_layer_counts<S: LayerStore>(store: &S, invalidate: bool) -> io::Result<()> {
