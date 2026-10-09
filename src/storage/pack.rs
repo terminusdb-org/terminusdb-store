@@ -35,6 +35,22 @@ pub trait Packable {
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<()>;
+
+    /// Verify that the specified layers from the given pack are identical
+    /// to what is already in this store, returning the list of layer ids
+    /// whose pack contents differ from the stored layer.
+    ///
+    /// Every file contained in the pack for a verified layer must exist
+    /// in this store with identical contents. Files that only exist in
+    /// the store (such as rollups written after export) are ignored.
+    ///
+    /// Specified layers that are not present in this store are silently
+    /// ignored, as they cannot be verified.
+    async fn verify_pack_layers(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+    ) -> io::Result<Vec<[u32; 5]>>;
 }
 
 #[async_trait]
@@ -131,6 +147,78 @@ impl<T: PersistentLayerStore> Packable for T {
 
             Ok(())
         })
+    }
+
+    async fn verify_pack_layers(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+    ) -> io::Result<Vec<[u32; 5]>> {
+        let mut layer_id_set = HashSet::new();
+        for id in layer_ids {
+            // only layers that already exist can be verified
+            if self.directory_exists(id).await? {
+                layer_id_set.insert(name_to_string(id));
+            }
+        }
+
+        let mut mismatched = HashSet::new();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| {
+            let cursor = io::Cursor::new(pack);
+            let tar = GzDecoder::new(cursor);
+            let mut archive = Archive::new(tar);
+
+            for e in archive.entries()? {
+                let mut entry = e?;
+                let path = entry.path()?;
+                let os_file_name = path.file_name().unwrap();
+                let file_name = os_file_name
+                    .to_str()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unexpected non-utf8 directory name",
+                        )
+                    })?
+                    .to_owned();
+
+                let layer_id = path.iter().next().and_then(|p| p.to_str()).unwrap_or("");
+
+                if !layer_id_set.contains(layer_id) {
+                    continue;
+                }
+
+                let layer_id_arr = string_to_name(layer_id).unwrap();
+
+                let header = entry.header();
+                if !header.entry_type().is_file() {
+                    continue;
+                }
+
+                let mut content = Vec::with_capacity(header.size()? as usize);
+                entry.read_to_end(&mut content)?;
+
+                let identical = handle.block_on(async {
+                    if !self.file_exists(layer_id_arr, &file_name).await? {
+                        return Ok::<_, io::Error>(false);
+                    }
+                    let file = self.get_file(layer_id_arr, &file_name).await?;
+                    let existing = file.map().await?;
+                    Ok(&*existing == content.as_slice())
+                })?;
+
+                if !identical {
+                    mismatched.insert(layer_id_arr);
+                }
+            }
+
+            Ok::<_, io::Error>(())
+        })?;
+
+        let mut result: Vec<[u32; 5]> = mismatched.into_iter().collect();
+        result.sort_unstable();
+        Ok(result)
     }
 }
 
@@ -320,6 +408,14 @@ impl Packable for CachedLayerStore {
     ) -> io::Result<()> {
         self.inner.import_layers(pack, layer_ids).await
     }
+
+    async fn verify_pack_layers(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+    ) -> io::Result<Vec<[u32; 5]>> {
+        self.inner.verify_pack_layers(pack, layer_ids).await
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +474,80 @@ mod tests {
                 ValueTriple::new_node("duck", "likes", "cow")
             ],
             triples
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_pack_layers_identical_and_unknown() {
+        let dir1 = tempdir().unwrap();
+        let store1 = Arc::new(DirectoryLayerStore::new(dir1.path()));
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+
+        let mut builder = store1.create_base_layer().await.unwrap();
+        let base_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("cow", "likes", "duck"));
+        builder.add_value_triple(ValueTriple::new_node("duck", "hates", "cow"));
+        builder.commit_boxed().await.unwrap();
+
+        let export = store1
+            .export_layers(Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+
+        // a layer that doesn't exist can't be verified and is ignored
+        assert_eq!(
+            Vec::<[u32; 5]>::new(),
+            store2
+                .verify_pack_layers(&export, Box::new(vec![base_name].into_iter()))
+                .await
+                .unwrap()
+        );
+
+        store2
+            .import_layers(&export, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+
+        // an identical layer verifies cleanly
+        assert_eq!(
+            Vec::<[u32; 5]>::new(),
+            store2
+                .verify_pack_layers(&export, Box::new(vec![base_name].into_iter()))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_pack_layers_detects_mismatch() {
+        let dir1 = tempdir().unwrap();
+        let store1 = Arc::new(DirectoryLayerStore::new(dir1.path()));
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+
+        let mut builder = store1.create_base_layer().await.unwrap();
+        let base_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("cow", "likes", "duck"));
+        builder.commit_boxed().await.unwrap();
+
+        let export = store1
+            .export_layers(Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+
+        // an empty layer with the same name has different contents
+        store2
+            .create_base_layer_with_name(base_name)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vec![base_name],
+            store2
+                .verify_pack_layers(&export, Box::new(vec![base_name].into_iter()))
+                .await
+                .unwrap()
         );
     }
 }

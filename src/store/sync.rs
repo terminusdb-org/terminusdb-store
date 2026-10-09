@@ -591,6 +591,13 @@ impl SyncStore {
         inner.map(SyncStoreLayerBuilder::wrap)
     }
 
+    /// Create an empty base layer with the given name.
+    ///
+    /// Fails if a layer with this name already exists.
+    pub fn create_named_base_layer(&self, name: [u32; 5]) -> io::Result<()> {
+        task_sync(self.inner.layer_store.create_base_layer_with_name(name))
+    }
+
     pub fn merge_base_layers(
         &self,
         layers: &[[u32; 5]],
@@ -619,6 +626,20 @@ impl SyncStore {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<()> {
         task_sync(self.inner.layer_store.import_layers(pack, layer_ids))
+    }
+
+    /// Verify that the specified layers from the given pack are identical
+    /// to what is already in this store, returning the list of layer ids
+    /// whose pack contents differ from the stored layer.
+    ///
+    /// Specified layers that are not present in this store are silently
+    /// ignored, as they cannot be verified.
+    pub fn verify_pack_layers(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+    ) -> io::Result<Vec<[u32; 5]>> {
+        task_sync(self.inner.layer_store.verify_pack_layers(pack, layer_ids))
     }
 
     /// Returns cache statistics: (total_entries, live_entries, dead_entries)

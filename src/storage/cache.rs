@@ -351,6 +351,10 @@ impl LayerStore for CachedLayerStore {
         self.inner.create_base_layer().await
     }
 
+    async fn create_base_layer_with_name(&self, name: [u32; 5]) -> io::Result<()> {
+        self.inner.create_base_layer_with_name(name).await
+    }
+
     async fn create_child_layer(&self, parent: [u32; 5]) -> io::Result<Box<dyn LayerBuilder>> {
         self.inner
             .create_child_layer_with_cache(parent, self.cache.clone())
