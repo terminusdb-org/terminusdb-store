@@ -1486,7 +1486,12 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
     }
 
     async fn get_file(&self, directory: [u32; 5], name: &str) -> io::Result<Self::File> {
-        let file_type = FILENAME_ENUM_MAP[name];
+        let Some(&file_type) = FILENAME_ENUM_MAP.get(name) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown layer file name: {name}"),
+            ));
+        };
         if file_type == LayerFileEnum::Rollup {
             // special case! This is always coming from disk, in its own file
             return Ok(ArchiveLayerHandle::Rollup(ArchiveRollupFile {
@@ -1523,7 +1528,9 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
     }
 
     async fn file_exists(&self, directory: [u32; 5], file: &str) -> io::Result<bool> {
-        let file_type = FILENAME_ENUM_MAP[file];
+        let Some(&file_type) = FILENAME_ENUM_MAP.get(file) else {
+            return Ok(false);
+        };
         if file_type == LayerFileEnum::Rollup {
             // special case! This is always coming out of the persistent metadata
             return Ok(self.metadata_backend.get_rollup(directory).await?.is_some());
@@ -1606,6 +1613,37 @@ mod tests {
         }
 
         assert!(!header.is_present(LayerFileEnum::NodeDictionaryOffsets));
+    }
+
+    #[tokio::test]
+    async fn unknown_file_name_is_not_found_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DirectoryArchiveBackend::new(dir.path().to_path_buf());
+        let store = ArchiveLayerStore::new(backend.clone(), backend);
+        let layer = [1, 2, 3, 4, 5];
+
+        assert!(!store
+            .file_exists(layer, "future_index_bits.bitarray")
+            .await
+            .unwrap());
+
+        match store.get_file(layer, "future_index_bits.bitarray").await {
+            Err(e) => assert_eq!(io::ErrorKind::NotFound, e.kind()),
+            Ok(_) => panic!("expected NotFound for unknown file name"),
+        }
+    }
+
+    #[tokio::test]
+    async fn known_file_names_still_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DirectoryArchiveBackend::new(dir.path().to_path_buf());
+        let store = ArchiveLayerStore::new(backend.clone(), backend);
+        let layer = [1, 2, 3, 4, 5];
+
+        // a known name still maps to a file handle, even though the
+        // layer does not exist in storage
+        assert!(!store.file_exists(layer, "parent.hex").await.unwrap());
+        store.get_file(layer, "parent.hex").await.unwrap();
     }
 
     #[cfg(feature = "rollup_metadata_experimental")]
