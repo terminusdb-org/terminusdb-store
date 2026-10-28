@@ -468,6 +468,26 @@ impl Layer for SyncStoreLayer {
         self.inner.triple_removal_count()
     }
 
+    fn count_triples(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        self.inner.count_triples(subject, predicate, object)
+    }
+
+    fn count_triples_value_range(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> usize {
+        self.inner
+            .count_triples_value_range(subject, predicate, low, high)
+    }
+
     fn all_counts(&self) -> LayerCounts {
         self.inner.all_counts()
     }

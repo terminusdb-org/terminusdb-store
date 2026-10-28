@@ -137,7 +137,7 @@ impl StoreLayerBuilder {
 
         match builder {
             None => {
-                return Err(io::Error::new(
+                Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "builder has already been committed",
                 ))
@@ -568,7 +568,7 @@ impl StoreLayer {
 }
 
 impl PartialEq for StoreLayer {
-    #[allow(clippy::vtable_address_comparisons)]
+    #[allow(ambiguous_wide_pointer_comparisons)]
     fn eq(&self, other: &StoreLayer) -> bool {
         Arc::ptr_eq(&self.layer, &other.layer)
     }
@@ -680,6 +680,26 @@ impl Layer for StoreLayer {
 
     fn triple_removal_count(&self) -> usize {
         self.layer.triple_removal_count()
+    }
+
+    fn count_triples(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        self.layer.count_triples(subject, predicate, object)
+    }
+
+    fn count_triples_value_range(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> usize {
+        self.layer
+            .count_triples_value_range(subject, predicate, low, high)
     }
 
     fn all_counts(&self) -> LayerCounts {
@@ -1709,7 +1729,7 @@ mod tests {
 
         let rebase_builder = layer2.open_write().await.unwrap();
 
-        let _ = rebase_builder.apply_delta(&delta).await.unwrap();
+        rebase_builder.apply_delta(&delta).await.unwrap();
 
         let rebase_layer = rebase_builder.commit().await.unwrap();
 

@@ -98,8 +98,8 @@ pub trait Layer: Send + Sync {
         self.subject_id(&triple.subject).and_then(|subject| {
             self.predicate_id(&triple.predicate).and_then(|predicate| {
                 match &triple.object {
-                    ObjectType::Node(node) => self.object_node_id(&node),
-                    ObjectType::Value(value) => self.object_value_id(&value),
+                    ObjectType::Node(node) => self.object_node_id(node),
+                    ObjectType::Value(value) => self.object_value_id(value),
                 }
                 .map(|object| IdTriple {
                     subject,
@@ -148,11 +148,11 @@ pub trait Layer: Send + Sync {
                 .unwrap_or(PossiblyResolved::Unresolved(triple.predicate)),
             object: match &triple.object {
                 ObjectType::Node(node) => self
-                    .object_node_id(&node)
+                    .object_node_id(node)
                     .map(PossiblyResolved::Resolved)
                     .unwrap_or(PossiblyResolved::Unresolved(triple.object)),
                 ObjectType::Value(value) => self
-                    .object_value_id(&value)
+                    .object_value_id(value)
                     .map(PossiblyResolved::Resolved)
                     .unwrap_or(PossiblyResolved::Unresolved(triple.object)),
             },
@@ -181,6 +181,63 @@ pub trait Layer: Send + Sync {
     /// Returns the total amount of triples in this layer and all its parents.
     fn triple_count(&self) -> usize {
         self.triple_addition_count() - self.triple_removal_count()
+    }
+
+    /// Returns the number of distinct triples matching the given partially-bound
+    /// pattern that are visible at this layer (additions minus removals).
+    ///
+    /// Each `None` component acts as a wildcard. `Some(0)` counts nothing, as 0 is
+    /// never a valid id. The default implementation counts via the various triple
+    /// iterators; `InternalLayer` overrides this with index-derived counts that do
+    /// not materialize matching triples.
+    fn count_triples(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        match (subject, predicate, object) {
+            (None, None, None) => self.triple_count(),
+            (Some(subject), None, None) => self.triples_s(subject).count(),
+            (Some(subject), Some(predicate), None) => self.triples_sp(subject, predicate).count(),
+            (Some(subject), Some(predicate), Some(object)) => {
+                self.triple_exists(subject, predicate, object) as usize
+            }
+            (Some(subject), None, Some(object)) => self
+                .triples_s(subject)
+                .filter(move |t| t.object == object)
+                .count(),
+            (None, Some(predicate), None) => self.triples_p(predicate).count(),
+            (None, Some(predicate), Some(object)) => self
+                .triples_p(predicate)
+                .filter(move |t| t.object == object)
+                .count(),
+            (None, None, Some(object)) => self.triples_o(object).count(),
+        }
+    }
+
+    /// Returns the amount of triples whose object value falls in the half-open
+    /// range [low, high), optionally restricted to a subject and/or predicate.
+    ///
+    /// The default implementation counts via `triples_value_range`; `InternalLayer`
+    /// overrides this with index-derived counts.
+    fn count_triples_value_range(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> usize {
+        if low.datatype() != high.datatype() {
+            return 0;
+        }
+
+        self.triples_value_range(low, high)
+            .filter(move |t| {
+                subject.is_none_or(|s| t.subject == s)
+                    && predicate.is_none_or(|p| t.predicate == p)
+            })
+            .count()
     }
 
     fn single_triple_sp(&self, subject: u64, predicate: u64) -> Option<IdTriple>;
@@ -297,7 +354,7 @@ impl<T: Clone + PartialEq + Eq + PartialOrd + Ord + Hash> PossiblyResolved<T> {
     /// Return a PossiblyResolved with the inner value as a reference.
     pub fn as_ref(&self) -> PossiblyResolved<&T> {
         match self {
-            Self::Unresolved(u) => PossiblyResolved::Unresolved(&u),
+            Self::Unresolved(u) => PossiblyResolved::Unresolved(u),
             Self::Resolved(id) => PossiblyResolved::Resolved(*id),
         }
     }
@@ -453,8 +510,7 @@ mod tests {
         let base: Arc<InternalLayer> = Arc::new(
             BaseLayer::load_from_files([1, 2, 3, 4, 5], &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -466,8 +522,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 1], base.clone(), &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         // TODO why are we not using these results?
@@ -509,8 +564,7 @@ mod tests {
         let base: Arc<InternalLayer> = Arc::new(
             BaseLayer::load_from_files([1, 2, 3, 4, 5], &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -522,8 +576,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 1], base, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -535,8 +588,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 2], child, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let triples: Vec<_> = child
@@ -563,8 +615,7 @@ mod tests {
         let base: Arc<InternalLayer> = Arc::new(
             BaseLayer::load_from_files([1, 2, 3, 4, 5], &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -576,8 +627,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 1], base, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -589,8 +639,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 2], child, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let id_triple_1 = child
@@ -660,8 +709,7 @@ mod tests {
         let base: Arc<InternalLayer> = Arc::new(
             BaseLayer::load_from_files([1, 2, 3, 4, 5], &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let mut results: Vec<_> = base

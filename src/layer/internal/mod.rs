@@ -493,6 +493,64 @@ impl InternalLayer {
         }
     }
 
+    /// Count triple additions in this layer's own positive index that match the
+    /// given partially-bound pattern, without enumerating them.
+    pub fn internal_triple_pattern_addition_count(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        internal_layer_triple_count(
+            LayerCountIndexes {
+                subjects: self.pos_subjects(),
+                objects: self.pos_objects(),
+                s_p_adjacency_list: self.pos_s_p_adjacency_list(),
+                sp_o_adjacency_list: self.pos_sp_o_adjacency_list(),
+                o_ps_adjacency_list: self.pos_o_ps_adjacency_list(),
+                predicate_wavelet_tree: Some(self.pos_predicate_wavelet_tree()),
+            },
+            subject,
+            predicate,
+            object,
+        )
+    }
+
+    /// Count triple removals in this layer's own negative index that match the
+    /// given partially-bound pattern, without enumerating them.
+    pub fn internal_triple_pattern_removal_count(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        match (
+            self.neg_subjects(),
+            self.neg_objects(),
+            self.neg_s_p_adjacency_list(),
+            self.neg_sp_o_adjacency_list(),
+            self.neg_o_ps_adjacency_list(),
+            self.neg_predicate_wavelet_tree(),
+        ) {
+            (subjects, objects, Some(s_p), Some(sp_o), Some(o_ps), wavelet) => {
+                internal_layer_triple_count(
+                    LayerCountIndexes {
+                        subjects,
+                        objects,
+                        s_p_adjacency_list: s_p,
+                        sp_o_adjacency_list: sp_o,
+                        o_ps_adjacency_list: o_ps,
+                        predicate_wavelet_tree: wavelet,
+                    },
+                    subject,
+                    predicate,
+                    object,
+                )
+            }
+            _ => 0,
+        }
+    }
+
     pub fn immediate_layers(&self) -> Vec<&InternalLayer> {
         let mut layer = Some(self);
         let mut result = Vec::new();
@@ -506,6 +564,77 @@ impl InternalLayer {
         result.reverse();
 
         result
+    }
+
+    /// Collects the global object ids whose value falls in the half-open range
+    /// [low, high), across this layer and all its parents.
+    ///
+    /// Returns an empty vec if the bounds have different datatypes or the range
+    /// is empty.
+    pub fn value_range_object_ids(&self, low: &TypedDictEntry, high: &TypedDictEntry) -> Vec<u64> {
+        self.value_range_object_ids_inner(low, high, false)
+    }
+
+    /// Object ids whose value falls in `low..high`, resolving the typed
+    /// bounds per layer into a value-dictionary position range. `rev`
+    /// reverses the position order within each layer (layer order is kept).
+    fn value_range_object_ids_inner(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+        rev: bool,
+    ) -> Vec<u64> {
+        if low.datatype() != high.datatype() {
+            return Vec::new();
+        }
+
+        let dt = low.datatype();
+        let layers = self.immediate_layers();
+        let mut object_ids = Vec::new();
+        let mut parent_count = 0u64;
+
+        for layer in layers.iter() {
+            let node_dict_len = layer.node_dict_len() as u64;
+            let value_dict_len = layer.value_dict_len() as u64;
+
+            let value_dict = layer.value_dictionary();
+            let type_offset = match value_dict.type_segment(dt) {
+                Some((_, offset)) => offset,
+                None => {
+                    parent_count += node_dict_len + value_dict_len;
+                    continue;
+                }
+            };
+
+            let start = match value_dict.id_entry(low) {
+                IdLookupResult::Found(i) => i,
+                IdLookupResult::Closest(i) => i + 1,
+                IdLookupResult::NotFound => type_offset + 1,
+            };
+
+            let end = match value_dict.id_entry(high) {
+                IdLookupResult::Found(i) => i,
+                IdLookupResult::Closest(i) => i + 1,
+                IdLookupResult::NotFound => type_offset + 1,
+            };
+
+            let id_map = layer.node_value_id_map();
+            let positions: Box<dyn Iterator<Item = u64>> = if rev {
+                Box::new((start..end).rev())
+            } else {
+                Box::new(start..end)
+            };
+            for pos in positions {
+                let inner_id = pos + node_dict_len;
+                let outer_id = id_map.inner_to_outer(inner_id);
+                let global_id = outer_id + parent_count;
+                object_ids.push(global_id);
+            }
+
+            parent_count += node_dict_len + value_dict_len;
+        }
+
+        object_ids
     }
 
     pub fn immediate_layers_upto(&self, upto_layer_id: [u32; 5]) -> Vec<&InternalLayer> {
@@ -536,10 +665,7 @@ impl InternalLayer {
     }
 
     pub fn is_rollup(&self) -> bool {
-        match self {
-            Rollup(_) => true,
-            _ => false,
-        }
+matches!(self, Rollup(_))
     }
 }
 
@@ -647,7 +773,7 @@ impl Layer for InternalLayer {
                 parent_count = parent_count
                     - current_layer.node_dict_len() as u64
                     - current_layer.value_dict_len() as u64;
-                if corrected_id > parent_count as u64 {
+                if corrected_id > parent_count {
                     // subject, if it exists, is in this layer
                     corrected_id -= parent_count;
                 } else {
@@ -678,7 +804,7 @@ impl Layer for InternalLayer {
             let mut corrected_id = id;
             if let Some(parent) = current_layer.immediate_parent() {
                 parent_count -= current_layer.predicate_dict_len() as u64;
-                if corrected_id > parent_count as u64 {
+                if corrected_id > parent_count {
                     // subject, if it exists, is in this layer
                     corrected_id -= parent_count;
                 } else {
@@ -898,51 +1024,7 @@ impl Layer for InternalLayer {
         low: &TypedDictEntry,
         high: &TypedDictEntry,
     ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
-        if low.datatype() != high.datatype() {
-            return Box::new(std::iter::empty());
-        }
-
-        let dt = low.datatype();
-        let layers = self.immediate_layers();
-        let mut object_ids = Vec::new();
-        let mut parent_count = 0u64;
-
-        for layer in layers.iter() {
-            let node_dict_len = layer.node_dict_len() as u64;
-            let value_dict_len = layer.value_dict_len() as u64;
-
-            let value_dict = layer.value_dictionary();
-            let type_offset = match value_dict.type_segment(dt) {
-                Some((_, offset)) => offset,
-                None => {
-                    parent_count += node_dict_len + value_dict_len;
-                    continue;
-                }
-            };
-
-            let start = match value_dict.id_entry(low) {
-                IdLookupResult::Found(i) => i,
-                IdLookupResult::Closest(i) => i + 1,
-                IdLookupResult::NotFound => type_offset + 1,
-            };
-
-            let end = match value_dict.id_entry(high) {
-                IdLookupResult::Found(i) => i,
-                IdLookupResult::Closest(i) => i + 1,
-                IdLookupResult::NotFound => type_offset + 1,
-            };
-
-            let id_map = layer.node_value_id_map();
-            for pos in start..end {
-                let inner_id = pos + node_dict_len;
-                let outer_id = id_map.inner_to_outer(inner_id);
-                let global_id = outer_id + parent_count;
-                object_ids.push(global_id);
-            }
-
-            parent_count += node_dict_len + value_dict_len;
-        }
-
+        let object_ids = self.value_range_object_ids(low, high);
         let layer_clone = self.clone();
         Box::new(object_ids.into_iter().flat_map(move |oid| {
             InternalTripleObjectIterator::from_layer(&layer_clone)
@@ -951,56 +1033,56 @@ impl Layer for InternalLayer {
         }))
     }
 
+    // Counts the distinct id-triples matching the pattern that are VISIBLE at
+    // this layer. There is no "changed" triple state: layers are immutable
+    // deltas, so a change is a removal of one id-triple plus an addition of
+    // another. For a given id-triple, add/remove events alternate down the
+    // stack (a layer can only remove what a parent provides, and only add what
+    // is absent), so summing per-layer additions minus per-layer removals
+    // yields set membership — the same accounting `triple_count()` uses.
+    fn count_triples(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        let mut additions = 0;
+        let mut removals = 0;
+        let mut layer_opt = Some(self);
+        while let Some(layer) = layer_opt {
+            additions += layer.internal_triple_pattern_addition_count(subject, predicate, object);
+            removals += layer.internal_triple_pattern_removal_count(subject, predicate, object);
+            layer_opt = layer.immediate_parent();
+        }
+
+        additions - removals
+    }
+
+    fn count_triples_value_range(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> usize {
+        // shortcut: materializes the object ids in range and does a stack
+        // walk per id — O(#objects-in-range * #layers) index seeks plus an
+        // 8-byte-per-object vec. Same order as enumeration with smaller
+        // constants; beating it needs an index keyed on (object range,
+        // predicate), which the store doesn't have. Upgrade when range
+        // counts over wide value domains become a hot path.
+        self.value_range_object_ids(low, high)
+            .into_iter()
+            .map(|oid| self.count_triples(subject, predicate, Some(oid)))
+            .sum()
+    }
+
     fn triples_value_range_rev(
         &self,
         low: &TypedDictEntry,
         high: &TypedDictEntry,
     ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
-        if low.datatype() != high.datatype() {
-            return Box::new(std::iter::empty());
-        }
-
-        let dt = low.datatype();
-        let layers = self.immediate_layers();
-        let mut object_ids = Vec::new();
-        let mut parent_count = 0u64;
-
-        for layer in layers.iter() {
-            let node_dict_len = layer.node_dict_len() as u64;
-            let value_dict_len = layer.value_dict_len() as u64;
-
-            let value_dict = layer.value_dictionary();
-            let type_offset = match value_dict.type_segment(dt) {
-                Some((_, offset)) => offset,
-                None => {
-                    parent_count += node_dict_len + value_dict_len;
-                    continue;
-                }
-            };
-
-            let start = match value_dict.id_entry(low) {
-                IdLookupResult::Found(i) => i,
-                IdLookupResult::Closest(i) => i + 1,
-                IdLookupResult::NotFound => type_offset + 1,
-            };
-
-            let end = match value_dict.id_entry(high) {
-                IdLookupResult::Found(i) => i,
-                IdLookupResult::Closest(i) => i + 1,
-                IdLookupResult::NotFound => type_offset + 1,
-            };
-
-            let id_map = layer.node_value_id_map();
-            for pos in (start..end).rev() {
-                let inner_id = pos + node_dict_len;
-                let outer_id = id_map.inner_to_outer(inner_id);
-                let global_id = outer_id + parent_count;
-                object_ids.push(global_id);
-            }
-
-            parent_count += node_dict_len + value_dict_len;
-        }
-
+        let object_ids = self.value_range_object_ids_inner(low, high, true);
         let layer_clone = self.clone();
         Box::new(object_ids.into_iter().flat_map(move |oid| {
             InternalTripleObjectIterator::from_layer(&layer_clone)
@@ -1188,6 +1270,197 @@ pub(crate) fn layer_triple_exists(
     false
 }
 
+/// Maps an id to its 0-based left position in an adjacency list.
+///
+/// `array` is the sparse id map used when a layer does not store every
+/// possible id as a left (child layers, or sparse base layers). When it is
+/// `None`, lefts are the ids themselves.
+fn sparse_position(array: Option<&MonotonicLogArray>, value: u64, left_count: u64) -> Option<u64> {
+    if value == 0 {
+        return None;
+    }
+
+    match array {
+        None => {
+            if value > left_count {
+                None
+            } else {
+                Some(value - 1)
+            }
+        }
+        Some(array) => array.index_of(value).map(|i| i as u64),
+    }
+}
+
+/// Returns the [start, end) positions of the segment belonging to the given
+/// 0-based left position in an adjacency list.
+fn segment_bounds(adjacency_list: &AdjacencyList, left_position: u64) -> (u64, u64) {
+    let start = adjacency_list.offset_for(left_position + 1);
+    let end = adjacency_list.bits().select1(left_position + 1).unwrap() + 1;
+
+    (start, end)
+}
+
+/// Returns the first position in `nums[lo..hi)` whose value is not less than
+/// `value`, or `hi` if there is none. Requires the range to be sorted.
+fn lower_bound(adjacency_list: &AdjacencyList, value: u64, lo: u64, hi: u64) -> u64 {
+    let mut lo = lo;
+    let mut hi = hi;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if adjacency_list.num_at_pos(mid) < value {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    lo
+}
+
+/// Counts triples matching a partially-bound pattern in a single internal
+/// layer's index set, without enumerating the matching triples.
+///
+/// This works on either the positive or the negative structures of a layer.
+/// The s_p list may contain placeholder positions (predicate 0), each of which
+/// pairs with exactly one sp_o entry; these are subtracted out where the
+/// counted range can contain them.
+/// Borrows of the index structures of a single internal layer, either the
+/// positive or the negative set.
+struct LayerCountIndexes<'a> {
+    subjects: Option<&'a MonotonicLogArray>,
+    objects: Option<&'a MonotonicLogArray>,
+    s_p_adjacency_list: &'a AdjacencyList,
+    sp_o_adjacency_list: &'a AdjacencyList,
+    o_ps_adjacency_list: &'a AdjacencyList,
+    predicate_wavelet_tree: Option<&'a WaveletTree>,
+}
+
+fn internal_layer_triple_count(
+    indexes: LayerCountIndexes,
+    subject: Option<u64>,
+    predicate: Option<u64>,
+    object: Option<u64>,
+) -> usize {
+    let LayerCountIndexes {
+        subjects,
+        objects,
+        s_p_adjacency_list,
+        sp_o_adjacency_list,
+        o_ps_adjacency_list,
+        predicate_wavelet_tree,
+    } = indexes;
+    match (subject, predicate, object) {
+        (None, None, None) => {
+            sp_o_adjacency_list.right_count()
+                - predicate_wavelet_tree
+                    .and_then(|t| t.lookup(0))
+                    .map(|l| l.len())
+                    .unwrap_or(0)
+        }
+        (Some(s), p, o) => {
+            let s_position =
+                match sparse_position(subjects, s, s_p_adjacency_list.left_count() as u64) {
+                    Some(pos) => pos,
+                    None => return 0,
+                };
+            let (sp_start, sp_end) = segment_bounds(s_p_adjacency_list, s_position);
+            match p {
+                Some(p) => {
+                    if p == 0 {
+                        return 0;
+                    }
+                    // predicates within a subject segment are sorted
+                    let sp_pos = lower_bound(s_p_adjacency_list, p, sp_start, sp_end);
+                    if sp_pos == sp_end || s_p_adjacency_list.num_at_pos(sp_pos) != p {
+                        return 0;
+                    }
+                    let (o_start, o_end) = segment_bounds(sp_o_adjacency_list, sp_pos);
+                    match o {
+                        None => (o_end - o_start) as usize,
+                        Some(o) => {
+                            let pos = lower_bound(sp_o_adjacency_list, o, o_start, o_end);
+                            (pos < o_end && sp_o_adjacency_list.num_at_pos(pos) == o) as usize
+                        }
+                    }
+                }
+                None => {
+                    let o_start = sp_o_adjacency_list.offset_for(sp_start + 1);
+                    let o_end = sp_o_adjacency_list
+                        .bits()
+                        .select1(sp_end)
+                        .map(|e| e + 1)
+                        .unwrap_or(o_start);
+                    match o {
+                        None => {
+                            let total = (o_end - o_start) as usize;
+                            let zeros = predicate_wavelet_tree
+                                .and_then(|t| t.lookup(0))
+                                .map(|l| {
+                                    l.iter()
+                                        .take_while(|&pos| pos < sp_end)
+                                        .filter(|pos| *pos >= sp_start)
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            total - zeros
+                        }
+                        Some(o) => (o_start..o_end)
+                            .filter(|&pos| sp_o_adjacency_list.num_at_pos(pos) == o)
+                            .count(),
+                    }
+                }
+            }
+        }
+        (None, None, Some(o)) => {
+            let o_position =
+                match sparse_position(objects, o, o_ps_adjacency_list.left_count() as u64) {
+                    Some(pos) => pos,
+                    None => return 0,
+                };
+            let (ps_start, ps_end) = segment_bounds(o_ps_adjacency_list, o_position);
+            // shortcut: nums are sorted, so any zero padding sits at the
+            // segment start and is skipped by counting from the first
+            // nonzero position
+            let start = lower_bound(o_ps_adjacency_list, 1, ps_start, ps_end);
+            (ps_end - start) as usize
+        }
+        (None, Some(p), Some(o)) => {
+            if p == 0 {
+                return 0;
+            }
+            let o_position =
+                match sparse_position(objects, o, o_ps_adjacency_list.left_count() as u64) {
+                    Some(pos) => pos,
+                    None => return 0,
+                };
+            let (ps_start, ps_end) = segment_bounds(o_ps_adjacency_list, o_position);
+            (ps_start..ps_end)
+                .filter(|&pos| {
+                    let sp_pair_num = o_ps_adjacency_list.num_at_pos(pos);
+                    sp_pair_num != 0 && s_p_adjacency_list.pair_at_pos(sp_pair_num - 1).1 == p
+                })
+                .count()
+        }
+        (None, Some(p), None) => {
+            if p == 0 {
+                return 0;
+            }
+            // count the sp_o segment for every s_p position tagged with p
+            match predicate_wavelet_tree.and_then(|t| t.lookup(p)) {
+                None => 0,
+                Some(lookup) => (0..lookup.len())
+                    .map(|i| {
+                        let sp_pos = lookup.entry(i);
+                        let (o_start, o_end) = segment_bounds(sp_o_adjacency_list, sp_pos);
+                        (o_end - o_start) as usize
+                    })
+                    .sum(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -1264,6 +1537,190 @@ mod tests {
         assert_eq!(1, layer.internal_triple_layer_addition_count());
     }
 
+    fn create_counting_base_layer(store: &SyncStore) -> SyncStoreLayer {
+        let builder = store.create_base_layer().unwrap();
+
+        builder
+            .add_value_triple(ValueTriple::new_string_value("cow", "says", "moo"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("cow", "says", "sniff"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node("cow", "likes", "duck"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("duck", "says", "quack"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node("duck", "likes", "cow"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("pig", "says", "oink"))
+            .unwrap();
+
+        builder.commit().unwrap()
+    }
+
+    #[test]
+    fn count_triples_base_layer() {
+        let store = open_sync_memory_store();
+        let layer = create_counting_base_layer(&store);
+
+        let cow = layer.subject_id("cow").unwrap();
+        let duck = layer.subject_id("duck").unwrap();
+        let pig = layer.subject_id("pig").unwrap();
+        let says = layer.predicate_id("says").unwrap();
+        let likes = layer.predicate_id("likes").unwrap();
+        let moo = layer
+            .object_value_id(&String::make_entry(&"moo".to_string()))
+            .unwrap();
+        let quack = layer
+            .object_value_id(&String::make_entry(&"quack".to_string()))
+            .unwrap();
+
+        assert_eq!(6, layer.count_triples(None, None, None));
+        assert_eq!(3, layer.count_triples(Some(cow), None, None));
+        assert_eq!(2, layer.count_triples(Some(cow), Some(says), None));
+        assert_eq!(1, layer.count_triples(Some(cow), Some(likes), None));
+        assert_eq!(1, layer.count_triples(Some(cow), Some(says), Some(moo)));
+        assert_eq!(0, layer.count_triples(Some(cow), Some(says), Some(quack)));
+        assert_eq!(1, layer.count_triples(Some(cow), None, Some(duck)));
+        assert_eq!(1, layer.count_triples(Some(cow), None, Some(moo)));
+        assert_eq!(4, layer.count_triples(None, Some(says), None));
+        assert_eq!(2, layer.count_triples(None, Some(likes), None));
+        assert_eq!(1, layer.count_triples(None, Some(says), Some(moo)));
+        assert_eq!(1, layer.count_triples(None, Some(likes), Some(cow)));
+        assert_eq!(1, layer.count_triples(None, None, Some(duck)));
+        assert_eq!(1, layer.count_triples(None, None, Some(quack)));
+        // "pig" is a dictionary node but never an object: its o_ps segment
+        // is zero padding, which must not count
+        let pig_as_object = layer.object_node_id("pig").unwrap();
+        assert_eq!(0, layer.count_triples(None, None, Some(pig_as_object)));
+        assert_eq!(0, layer.count_triples(Some(9999), None, None));
+        assert_eq!(0, layer.count_triples(None, Some(9999), None));
+        assert_eq!(0, layer.count_triples(None, None, Some(9999)));
+        assert_eq!(0, layer.count_triples(Some(pig), Some(likes), None));
+    }
+
+    #[test]
+    fn count_triples_child_layer() {
+        let store = open_sync_memory_store();
+        let base = create_counting_base_layer(&store);
+        let builder = base.open_write().unwrap();
+
+        builder
+            .remove_value_triple(ValueTriple::new_string_value("cow", "says", "moo"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("horse", "says", "neigh"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node("duck", "likes", "pig"))
+            .unwrap();
+
+        let layer = builder.commit().unwrap();
+
+        let cow = layer.subject_id("cow").unwrap();
+        let duck = layer.subject_id("duck").unwrap();
+        let pig = layer.subject_id("pig").unwrap();
+        let says = layer.predicate_id("says").unwrap();
+        let likes = layer.predicate_id("likes").unwrap();
+        let moo = layer
+            .object_value_id(&String::make_entry(&"moo".to_string()))
+            .unwrap();
+        let neigh = layer
+            .object_value_id(&String::make_entry(&"neigh".to_string()))
+            .unwrap();
+
+        // 6 base - 1 removal + 2 additions
+        assert_eq!(7, layer.count_triples(None, None, None));
+        assert_eq!(2, layer.count_triples(Some(cow), None, None));
+        assert_eq!(1, layer.count_triples(Some(cow), Some(says), None));
+        assert_eq!(0, layer.count_triples(Some(cow), Some(says), Some(moo)));
+        assert_eq!(4, layer.count_triples(None, Some(says), None));
+        assert_eq!(0, layer.count_triples(None, Some(says), Some(moo)));
+        assert_eq!(1, layer.count_triples(None, Some(says), Some(neigh)));
+        assert_eq!(2, layer.count_triples(Some(duck), Some(likes), None));
+        assert_eq!(3, layer.count_triples(None, Some(likes), None));
+        assert_eq!(1, layer.count_triples(None, Some(likes), Some(pig)));
+        assert_eq!(1, layer.count_triples(None, None, Some(pig)));
+    }
+
+    #[test]
+    fn count_triples_value_range_base_layer() {
+        let store = open_sync_memory_store();
+        let layer = create_counting_base_layer(&store);
+
+        let cow = layer.subject_id("cow").unwrap();
+        let says = layer.predicate_id("says").unwrap();
+
+        let low = String::make_entry(&"a".to_string());
+        let high = String::make_entry(&"z".to_string());
+
+        // all string-valued objects fall in the range: moo, sniff, quack, oink
+        assert_eq!(4, layer.count_triples_value_range(None, None, &low, &high));
+        assert_eq!(
+            4,
+            layer.count_triples_value_range(None, Some(says), &low, &high)
+        );
+        assert_eq!(
+            2,
+            layer.count_triples_value_range(Some(cow), None, &low, &high)
+        );
+        assert_eq!(
+            2,
+            layer.count_triples_value_range(Some(cow), Some(says), &low, &high)
+        );
+
+        // narrower range: [moo, quack) -> moo, oink
+        let low = String::make_entry(&"moo".to_string());
+        let high = String::make_entry(&"quack".to_string());
+        assert_eq!(2, layer.count_triples_value_range(None, None, &low, &high));
+        assert_eq!(
+            1,
+            layer.count_triples_value_range(Some(cow), None, &low, &high)
+        );
+
+        // empty range
+        let low = String::make_entry(&"n".to_string());
+        let high = String::make_entry(&"n".to_string());
+        assert_eq!(0, layer.count_triples_value_range(None, None, &low, &high));
+    }
+
+    #[test]
+    fn count_triples_value_range_child_layer() {
+        let store = open_sync_memory_store();
+        let base = create_counting_base_layer(&store);
+        let builder = base.open_write().unwrap();
+
+        builder
+            .remove_value_triple(ValueTriple::new_string_value("cow", "says", "moo"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("horse", "says", "neigh"))
+            .unwrap();
+
+        let layer = builder.commit().unwrap();
+
+        let cow = layer.subject_id("cow").unwrap();
+        let says = layer.predicate_id("says").unwrap();
+
+        let low = String::make_entry(&"a".to_string());
+        let high = String::make_entry(&"z".to_string());
+
+        // moo removed, neigh added: sniff, quack, oink, neigh
+        assert_eq!(4, layer.count_triples_value_range(None, None, &low, &high));
+        assert_eq!(
+            1,
+            layer.count_triples_value_range(Some(cow), None, &low, &high)
+        );
+        assert_eq!(
+            1,
+            layer.count_triples_value_range(Some(cow), Some(says), &low, &high)
+        );
+    }
+
     #[tokio::test]
     async fn object_is_node_in_base_layer() {
         let dir = tempdir().unwrap();
@@ -1280,5 +1737,30 @@ mod tests {
         assert_eq!(Some(true), layer.id_object_is_node(2));
         assert_eq!(Some(false), layer.id_object_is_node(3));
         assert_eq!(None, layer.id_object_is_node(4));
+    }
+}
+
+
+#[cfg(test)]
+mod placeholder_probe {
+    use crate::layer::internal::base::base_tests::*;
+    use super::*;
+
+    // Invariant probe: no current builder writes a predicate-0 entry into
+    // s_p (add_triple drops 0 on entry), while o_ps DOES contain [0]
+    // segments for ids that exist in the object-id space but never appear
+    // as objects. The zero-skip in internal_layer_triple_count relies on
+    // that distinction. If a future writer starts emitting predicate-0
+    // placeholders, this test fails and the subtraction paths must be
+    // re-verified.
+    #[tokio::test]
+    async fn built_layers_have_no_predicate_zero_but_object_padding() {
+        let layer = example_base_layer().await;
+        assert!(layer.pos_predicate_wavelet_tree().lookup(0).is_none());
+        let o_ps = layer.pos_o_ps_adjacency_list();
+        let o_zeros = (0..o_ps.right_count() as u64)
+            .filter(|&i| o_ps.num_at_pos(i) == 0)
+            .count();
+        assert!(o_zeros > 0);
     }
 }
