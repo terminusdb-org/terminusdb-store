@@ -1744,7 +1744,6 @@ mod tests {
 #[cfg(test)]
 mod placeholder_probe {
     use crate::layer::internal::base::base_tests::*;
-    use super::*;
 
     // Invariant probe: no current builder writes a predicate-0 entry into
     // s_p (add_triple drops 0 on entry), while o_ps DOES contain [0]

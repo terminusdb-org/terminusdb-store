@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -40,6 +40,9 @@ pub trait Packable {
     ///
     /// Returns the list of layer ids that already existed with
     /// differing contents.
+    ///
+    /// Pack entries with file names that are unknown to this binary are
+    /// skipped with a warning.
     async fn import_layers(
         &self,
         pack: &[u8],
@@ -84,12 +87,12 @@ impl<T: PersistentLayerStore> Packable for T {
             // against the pack contents instead of being overwritten.
             if self.directory_exists(id).await? {
                 existing_id_set.insert(layer_id);
-            } else {
-                self.create_named_directory(id).await?;
             }
         }
 
         let mut mismatched = HashSet::new();
+        let mut created_id_set = HashSet::new();
+        let mut skipped_files = HashSet::new();
         let handle = tokio::runtime::Handle::current();
         tokio::task::block_in_place(|| {
             let cursor = io::Cursor::new(pack);
@@ -103,16 +106,6 @@ impl<T: PersistentLayerStore> Packable for T {
             for e in archive.entries()? {
                 let mut entry = e?;
                 let path = entry.path()?;
-                let os_file_name = path.file_name().unwrap();
-                let file_name = os_file_name
-                    .to_str()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "unexpected non-utf8 directory name",
-                        )
-                    })?
-                    .to_owned();
 
                 // check if entry is prefixed with a layer id we are interested in
                 let layer_id = path
@@ -122,52 +115,100 @@ impl<T: PersistentLayerStore> Packable for T {
                     .unwrap_or("")
                     .to_string();
 
-                if layer_id_set.contains(&layer_id) {
-                    // this conversion should always work cause we are
-                    // only able to match things that went through the
-                    // conversion in the opposite direction.
-                    let layer_id_arr = string_to_name(&layer_id).unwrap();
+                if !layer_id_set.contains(&layer_id) {
+                    continue;
+                }
 
-                    let header = entry.header();
-                    if !header.entry_type().is_file() {
-                        continue;
-                    }
+                // this conversion should always work cause we are
+                // only able to match things that went through the
+                // conversion in the opposite direction.
+                let layer_id_arr = string_to_name(&layer_id).unwrap();
 
-                    let mut content = Vec::with_capacity(header.size()? as usize);
-                    entry.read_to_end(&mut content)?;
+                let header = entry.header();
+                if !header.entry_type().is_file() {
+                    continue;
+                }
 
-                    if existing_id_set.contains(&layer_id) {
-                        // verify this file against the stored layer
-                        let identical = handle.block_on(async {
-                            if !self.file_exists(layer_id_arr, &file_name).await? {
-                                return Ok::<_, io::Error>(false);
-                            }
-                            let file = self.get_file(layer_id_arr, &file_name).await?;
-                            let existing = file.map().await?;
-                            Ok(&*existing == content.as_slice())
-                        })?;
+                // a layer only contains flat <layer>/<file> entries;
+                // anything else is malformed and must not be reduced to
+                // its last component
+                let mut components = path.components();
+                if !matches!(components.next(), Some(Component::Normal(_)))
+                    || !matches!(components.next(), Some(Component::Normal(_)))
+                    || components.next().is_some()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("malformed pack entry path: {}", path.display()),
+                    ));
+                }
 
-                        if !identical {
-                            mismatched.insert(layer_id_arr);
+                let Some(os_file_name) = path.file_name() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("pack entry has no file name: {}", path.display()),
+                    ));
+                };
+                let file_name = os_file_name
+                    .to_str()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "unexpected non-utf8 file name")
+                    })?
+                    .to_owned();
+
+                // a file this binary does not know was written by a newer
+                // version and is optional by definition, so we skip it
+                if !FILENAME_ENUM_MAP.contains_key(file_name.as_str()) {
+                    skipped_files.insert(format!("{layer_id}/{file_name}"));
+                    continue;
+                }
+
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content)?;
+
+                if existing_id_set.contains(&layer_id) {
+                    // verify this file against the stored layer
+                    let identical = handle.block_on(async {
+                        if !self.file_exists(layer_id_arr, &file_name).await? {
+                            return Ok::<_, io::Error>(false);
                         }
-                    } else {
-                        handle.block_on(async move {
-                            let file = self.get_file(layer_id_arr, &file_name).await?;
-                            let mut writer = file.open_write().await?;
-                            writer.write_all(&content).await?;
-                            writer.flush().await?;
-                            writer.sync_all().await?;
+                        let file = self.get_file(layer_id_arr, &file_name).await?;
+                        let existing = file.map().await?;
+                        Ok(&*existing == content.as_slice())
+                    })?;
 
-                            Ok::<_, io::Error>(())
-                        })?;
+                    if !identical {
+                        mismatched.insert(layer_id_arr);
                     }
+                } else {
+                    // create the layer only when it actually contributes a
+                    // file; absent or fully-skipped layers leave nothing
+                    // behind
+                    if !created_id_set.contains(&layer_id_arr) {
+                        handle.block_on(self.create_named_directory(layer_id_arr))?;
+                        created_id_set.insert(layer_id_arr);
+                    }
+                    handle.block_on(async move {
+                        let file = self.get_file(layer_id_arr, &file_name).await?;
+                        let mut writer = file.open_write().await?;
+                        writer.write_all(&content).await?;
+                        writer.flush().await?;
+                        writer.sync_all().await?;
+
+                        Ok::<_, io::Error>(())
+                    })?;
                 }
             }
 
+            // a skipped file means the pack was produced by a newer
+            // binary, an event the operator needs to see
+            for skipped_file in &skipped_files {
+                eprintln!("warning: skipping unknown layer file in pack: {skipped_file}");
+            }
+
             // only layers that were actually created get finalized
-            for layer_id in layer_id_set.difference(&existing_id_set) {
-                let layer_id_arr = string_to_name(layer_id).unwrap();
-                handle.block_on(self.finalize_layer(layer_id_arr))?;
+            for layer_id_arr in &created_id_set {
+                handle.block_on(self.finalize_layer(*layer_id_arr))?;
             }
 
             Ok::<_, io::Error>(())
@@ -371,6 +412,7 @@ impl Packable for CachedLayerStore {
 mod tests {
     use super::*;
     use crate::layer::*;
+    use crate::storage::archive::{ArchiveLayerStore, DirectoryArchiveBackend};
     use crate::storage::directory::*;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -494,5 +536,247 @@ mod tests {
         // the existing layer was not overwritten
         let layer = store2.get_layer(base_name).await.unwrap().unwrap();
         assert_eq!(0, layer.node_and_value_count());
+    }
+
+    async fn export_base_layer_pack() -> (tempfile::TempDir, [u32; 5], Vec<u8>) {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(DirectoryLayerStore::new(dir.path()));
+        let mut builder = store.create_base_layer().await.unwrap();
+        let base_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("cow", "likes", "duck"));
+        builder.add_value_triple(ValueTriple::new_node("duck", "hates", "cow"));
+        builder.commit_boxed().await.unwrap();
+
+        let export = store
+            .export_layers(Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+
+        (dir, base_name, export)
+    }
+
+    /// Returns a copy of the given pack, with `add_entry` invoked on the
+    /// builder after all original entries have been copied over.
+    fn repack_with_extra(
+        pack: &[u8],
+        add_entry: impl FnOnce(&mut tar::Builder<&mut GzEncoder<Vec<u8>>>),
+    ) -> Vec<u8> {
+        let mut decompressed = Vec::new();
+        GzDecoder::new(pack).read_to_end(&mut decompressed).unwrap();
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut source = tar::Archive::new(io::Cursor::new(&decompressed));
+            for entry in source.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let header = entry.header().clone();
+                builder.append(&header, &mut entry).unwrap();
+            }
+            add_entry(&mut builder);
+            builder.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    /// Appends a regular file entry to the pack. `tweak_header` runs after
+    /// the standard fields are set, so tests can deliberately lie about
+    /// e.g. the entry size.
+    fn inject_pack_entry(
+        pack: &[u8],
+        path: &str,
+        contents: &[u8],
+        tweak_header: impl FnOnce(&mut Header),
+    ) -> Vec<u8> {
+        repack_with_extra(pack, |builder| {
+            let mut header = Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_entry_type(EntryType::Regular);
+            header.set_size(contents.len() as u64);
+            tweak_header(&mut header);
+            builder
+                .append_data(&mut header, path, io::Cursor::new(contents))
+                .unwrap();
+        })
+    }
+
+    /// Appends a regular file entry whose path is written verbatim into the
+    /// header name field. `append_data` refuses `..` components, so a
+    /// hostile path needs the bytes to be set directly.
+    fn inject_raw_path_entry(pack: &[u8], path: &[u8], contents: &[u8]) -> Vec<u8> {
+        repack_with_extra(pack, |builder| {
+            let mut header = Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_entry_type(EntryType::Regular);
+            header.set_size(contents.len() as u64);
+            header.as_gnu_mut().unwrap().name[..path.len()].copy_from_slice(path);
+            header.set_cksum();
+            builder.append(&header, io::Cursor::new(contents)).unwrap();
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_skips_unknown_files() {
+        let (_dir, base_name, export) = export_base_layer_pack().await;
+        let layer_name = name_to_string(base_name);
+        let injected = inject_pack_entry(
+            &export,
+            &format!("{layer_name}/zzz_future_file.bin"),
+            b"future data",
+            |_| {},
+        );
+
+        // directory backend
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+        let mismatched = store2
+            .import_layers(&injected, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+        assert!(mismatched.is_empty());
+        assert!(store2.get_layer(base_name).await.unwrap().is_some());
+        assert!(!store2
+            .file_exists(base_name, "zzz_future_file.bin")
+            .await
+            .unwrap());
+
+        // archive backend
+        let archive_dir = tempdir().unwrap();
+        let backend = DirectoryArchiveBackend::new(archive_dir.path().to_path_buf());
+        let store3 = ArchiveLayerStore::new(backend.clone(), backend);
+        let mismatched = store3
+            .import_layers(&injected, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+        assert!(mismatched.is_empty());
+        assert!(store3.get_layer(base_name).await.unwrap().is_some());
+        assert!(!store3
+            .file_exists(base_name, "zzz_future_file.bin")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_unknown_file_does_not_flag_mismatch() {
+        let (_dir, base_name, export) = export_base_layer_pack().await;
+        let layer_name = name_to_string(base_name);
+        let injected = inject_pack_entry(
+            &export,
+            &format!("{layer_name}/zzz_future_file.bin"),
+            b"future data",
+            |_| {},
+        );
+
+        let archive_dir = tempdir().unwrap();
+        let backend = DirectoryArchiveBackend::new(archive_dir.path().to_path_buf());
+        let store2 = ArchiveLayerStore::new(backend.clone(), backend);
+
+        // first import creates the layer, skipping the unknown file
+        let mismatched = store2
+            .import_layers(&injected, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+        assert!(mismatched.is_empty());
+
+        // second import verifies the existing layer; the unknown file
+        // must not participate in verification
+        let mismatched = store2
+            .import_layers(&injected, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+        assert!(mismatched.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_rejects_nested_path() {
+        let (_dir, base_name, export) = export_base_layer_pack().await;
+        let layer_name = name_to_string(base_name);
+        let injected = inject_pack_entry(
+            &export,
+            &format!("{layer_name}/sub/parent.hex"),
+            b"evil",
+            |_| {},
+        );
+
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+        let err = store2
+            .import_layers(&injected, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidData, err.kind());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_rejects_traversal() {
+        let (_dir, base_name, export) = export_base_layer_pack().await;
+        let layer_name = name_to_string(base_name);
+        let injected = inject_raw_path_entry(
+            &export,
+            format!("{layer_name}/../parent.hex").as_bytes(),
+            b"evil",
+        );
+
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+        let err = store2
+            .import_layers(&injected, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidData, err.kind());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_no_panic_on_nameless_entry() {
+        let (_dir, base_name, export) = export_base_layer_pack().await;
+        let layer_name = name_to_string(base_name);
+        let injected =
+            inject_raw_path_entry(&export, format!("{layer_name}/..").as_bytes(), b"evil");
+
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+        let result = store2
+            .import_layers(&injected, Box::new(vec![base_name].into_iter()))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_ignores_absent_requested_layers() {
+        let (_dir, _base_name, export) = export_base_layer_pack().await;
+        let absent_name = [9, 8, 7, 6, 5];
+
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+        let mismatched = store2
+            .import_layers(&export, Box::new(vec![absent_name].into_iter()))
+            .await
+            .unwrap();
+        assert!(mismatched.is_empty());
+        assert!(!store2.directory_exists(absent_name).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_huge_declared_size_does_not_abort() {
+        let (_dir, base_name, export) = export_base_layer_pack().await;
+        let layer_name = name_to_string(base_name);
+        // a declared size beyond what memory can hold must not cause an
+        // allocation based on the attacker-controlled header value.
+        // anything larger overflows u64 during tar's own entry scanning.
+        let injected = inject_pack_entry(
+            &export,
+            &format!("{layer_name}/parent.hex"),
+            b"evil",
+            |header| header.set_size(isize::MAX as u64 + 1),
+        );
+
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+        let result = store2
+            .import_layers(&injected, Box::new(vec![base_name].into_iter()))
+            .await;
+        // no allocation is attempted from the declared size; the entry is
+        // then flagged as truncated by tar's own consistency check
+        assert!(result.is_err());
     }
 }
