@@ -83,13 +83,7 @@ impl Iterator for InternalLayerTriplePredicateIterator {
         // set the sp_boundary flag, ensuring that upon the subsequent
         // next() call, we move on to the next predicate.
         let next = self.subject_iterator.peek();
-        if next.is_none()
-            || next.map(|t| (t.subject, t.predicate)) != result.map(|t| (t.subject, t.predicate))
-        {
-            self.sp_boundary = true;
-        } else {
-            self.sp_boundary = false;
-        }
+        self.sp_boundary = next.is_none() || next.map(|t| (t.subject, t.predicate)) != result.map(|t| (t.subject, t.predicate));
 
         result
     }
@@ -190,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn base_triple_predicate_iterator() {
-        let base_layer: InternalLayer = example_base_layer().await.into();
+        let base_layer: InternalLayer = example_base_layer().await;
 
         let triples: Vec<_> = base_layer.internal_triple_additions_p(3).collect();
         let expected = vec![
@@ -204,7 +198,7 @@ mod tests {
 
     async fn child_layer() -> InternalLayer {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -224,7 +218,6 @@ mod tests {
         ChildLayer::load_from_files([5, 4, 3, 2, 1], parent, &child_files)
             .await
             .unwrap()
-            .into()
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::io::{self, Read};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -224,7 +224,7 @@ async fn tar_append_file<S: PersistentLayerStore, W: io::Write>(
     store: &S,
     tar: &mut tar::Builder<W>,
     layer: [u32; 5],
-    layer_path: &PathBuf,
+    layer_path: &Path,
     file_name: &str,
     mtime: u64,
 ) -> io::Result<()> {
@@ -254,7 +254,7 @@ async fn tar_append_file_if_exists<S: PersistentLayerStore, W: io::Write>(
     store: &S,
     tar: &mut tar::Builder<W>,
     layer: [u32; 5],
-    layer_path: &PathBuf,
+    layer_path: &Path,
     file_name: &str,
     mtime: u64,
 ) -> io::Result<()> {

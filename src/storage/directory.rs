@@ -126,7 +126,7 @@ impl DirectoryLabelStore {
 }
 
 fn get_label_from_data(name: String, data: &[u8]) -> io::Result<Label> {
-    let s = String::from_utf8_lossy(&data);
+    let s = String::from_utf8_lossy(data);
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() != 2 {
         return Err(io::Error::new(
@@ -141,7 +141,7 @@ fn get_label_from_data(name: String, data: &[u8]) -> io::Result<Label> {
     let version_str = &lines[0];
     let layer_str = &lines[1];
 
-    let version = u64::from_str_radix(version_str, 10);
+    let version = version_str.parse::<u64>();
     if version.is_err() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -378,8 +378,7 @@ impl LabelStore for CachedDirectoryLabelStore {
         p.push(format!("{}.label", label));
         let contents = b"0\n\n";
         match fs::metadata(&p).await {
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
+            Ok(_) => Err(io::Error::other(
                 "label was not in cached map but was found on disk",
             )),
             Err(e) => match e.kind() {
@@ -494,7 +493,7 @@ mod tests {
 
         let map = file.map().await.unwrap();
 
-        assert_eq!(&vec![1, 2, 3][..], &map.as_ref()[..]);
+        assert_eq!(&vec![1, 2, 3][..], map.as_ref());
     }
 
     #[tokio::test]
@@ -506,7 +505,7 @@ mod tests {
         let mut w = file.open_write().await.unwrap();
         let mut contents = vec![0u8; 4096 << 4];
         for i in 0..contents.capacity() {
-            contents[i] = (i as usize % 256) as u8;
+            contents[i] = (i % 256) as u8;
         }
 
         w.write_all(&contents).await.unwrap();

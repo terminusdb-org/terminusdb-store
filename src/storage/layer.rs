@@ -1420,8 +1420,7 @@ pub fn name_to_string(name: [u32; 5]) -> String {
 
 pub fn string_to_name(string: &str) -> Result<[u32; 5], std::io::Error> {
     if string.len() != 40 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("string not len 40: {}", string),
         ));
     }
@@ -1441,7 +1440,7 @@ pub fn string_to_name(string: &str) -> Result<[u32; 5], std::io::Error> {
 
 pub fn bytes_to_name(bytes: &[u8]) -> Result<[u32; 5], std::io::Error> {
     if bytes.len() != 40 {
-        Err(io::Error::new(io::ErrorKind::Other, "bytes not len 40"))
+        Err(io::Error::other("bytes not len 40"))
     } else {
         let string = String::from_utf8_lossy(bytes);
 
@@ -1522,12 +1521,11 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                             panic!("infinite rollup loop for layer {:?}", rollup);
                         }
 
-                        let original_parent;
-                        if self.layer_has_parent(current_layer).await? {
-                            original_parent = Some(self.read_parent_file(current_layer).await?);
+                        let original_parent = if self.layer_has_parent(current_layer).await? {
+                            Some(self.read_parent_file(current_layer).await?)
                         } else {
-                            original_parent = None;
-                        }
+                            None
+                        };
 
                         layers_to_load.pop().unwrap(); // we don't want to load this, we want to load the rollup instead!
                         layers_to_load.push((current_layer, Some((rollup, original_parent))));
@@ -1550,12 +1548,12 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     let files = self.base_layer_files(base_id).await?;
                     let base_layer = BaseLayer::load_from_files(base_id, &files).await?;
 
-                    layer = Arc::new(base_layer.into());
+                    layer = Arc::new(base_layer);
                 }
                 Some((rollup_id, original_parent_id_option)) => {
                     let files = self.base_layer_files(rollup_id).await?;
                     let base_layer: Arc<InternalLayer> =
-                        Arc::new(BaseLayer::load_from_files(rollup_id, &files).await?.into());
+                        Arc::new(BaseLayer::load_from_files(rollup_id, &files).await?);
                     cache.cache_layer(base_layer.clone());
 
                     layer = Arc::new(
@@ -1583,7 +1581,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     let files = self.child_layer_files(layer_id).await?;
                     let child_layer =
                         ChildLayer::load_from_files(layer_id, ancestor, &files).await?;
-                    layer = Arc::new(child_layer.into());
+                    layer = Arc::new(child_layer);
                 }
                 Some((rollup_id, original_parent_id_option)) => {
                     let original_parent_id = original_parent_id_option
@@ -1592,8 +1590,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     let files = self.child_layer_files(rollup_id).await?;
                     let child_layer: Arc<InternalLayer> = Arc::new(
                         ChildLayer::load_from_files(rollup_id, ancestor, &files)
-                            .await?
-                            .into(),
+                            .await?,
                     );
                     cache.cache_layer(child_layer.clone());
 
@@ -2005,9 +2002,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let mut base_pred_count = 0;
         let mut base_value_count = 0;
         walk_backwards_from_disk!(self, upto, current, {
-            base_node_count += self.get_node_count(current).await?.unwrap_or(0) as u64;
-            base_value_count += self.get_value_count(current).await?.unwrap_or(0) as u64;
-            base_pred_count += self.get_predicate_count(current).await?.unwrap_or(0) as u64;
+            base_node_count += self.get_node_count(current).await?.unwrap_or(0);
+            base_value_count += self.get_value_count(current).await?.unwrap_or(0);
+            base_pred_count += self.get_predicate_count(current).await?.unwrap_or(0);
         });
         let base_node_value_count = base_node_count + base_value_count;
         let mut node_value_count = base_node_value_count;
@@ -2048,8 +2045,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let stack_node_value_count = stack_node_count + stack_value_count;
 
         // figure out what keys are actually used through a prepass over all triples
-        let mut node_value_existences = bitvec![0;stack_node_value_count as usize+1];
-        let mut predicate_existences = bitvec![0;stack_pred_count as usize+1];
+        let mut node_value_existences = bitvec![0;stack_node_value_count+1];
+        let mut predicate_existences = bitvec![0;stack_pred_count+1];
         let mut num_triple_changes = 0;
         let layer_changes_upto = self.layer_changes_upto(layer.name(), upto).await?;
         for (change_type, triple) in layer_changes_upto.clone() {
@@ -2235,8 +2232,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let mut layer_files = Vec::with_capacity(layers.len());
         for layer in layers {
             if self.layer_has_parent(*layer).await? {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!(
                         "given layer is not a base layer: {}",
                         name_to_string(*layer)

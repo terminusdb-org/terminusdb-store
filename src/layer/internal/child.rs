@@ -722,7 +722,7 @@ pub mod child_tests {
     async fn empty_child_layer_equivalent_to_parent() {
         let base_layer = example_base_layer().await;
 
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -751,7 +751,7 @@ pub mod child_tests {
     async fn child_layer_can_have_inserts() {
         let base_layer = example_base_layer().await;
 
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -784,7 +784,7 @@ pub mod child_tests {
     async fn child_layer_can_have_deletes() {
         let base_layer = example_base_layer().await;
 
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -814,7 +814,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn child_layer_can_have_inserts_and_deletes() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -847,7 +847,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn iterate_child_layer_triples() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -887,7 +887,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn lookup_child_layer_triples_by_predicate() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -931,7 +931,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn adding_new_nodes_predicates_and_values_in_child() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -954,7 +954,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn old_dictionary_entries_in_child() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -997,7 +997,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn new_dictionary_entries_in_child() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -1040,7 +1040,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn lookup_additions_by_subject() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -1069,7 +1069,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn lookup_removals_by_subject() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -1098,7 +1098,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn create_empty_child_layer() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
 
@@ -1127,7 +1127,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn stream_child_triples() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
         let builder = ChildLayerFileBuilder::from_files(parent.clone(), &child_files)
@@ -1182,7 +1182,7 @@ pub mod child_tests {
     #[tokio::test]
     async fn count_triples() {
         let base_layer = example_base_layer().await;
-        let parent: Arc<InternalLayer> = Arc::new(base_layer.into());
+        let parent: Arc<InternalLayer> = Arc::new(base_layer);
 
         let child_files = child_layer_files();
         let builder = ChildLayerFileBuilder::from_files(parent.clone(), &child_files)

@@ -110,7 +110,7 @@ impl DirectoryArchiveBackend {
         let mut p = self.path.clone();
         let name_str = name_to_string(name);
         p.push(&name_str[0..PREFIX_DIR_SIZE]);
-        p.push(&format!("{}.larch", name_str));
+        p.push(format!("{}.larch", name_str));
 
         p
     }
@@ -119,7 +119,7 @@ impl DirectoryArchiveBackend {
         let mut p = self.path.clone();
         let name_str = name_to_string(name);
         p.push(&name_str[0..PREFIX_DIR_SIZE]);
-        p.push(&format!("{}.rollup.hex", name_str));
+        p.push(format!("{}.rollup.hex", name_str));
 
         p
     }
@@ -318,10 +318,10 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
             return Ok(None);
         }
         let data = result?;
-        let name = data.lines().skip(1).next().expect(
+        let name = data.lines().nth(1).expect(
             "Expected rollup file to have two lines but was unable to skip to the second line",
         );
-        Ok(Some(string_to_name(&name)?))
+        Ok(Some(string_to_name(name)?))
     }
 
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
@@ -374,11 +374,7 @@ enum CacheEntry {
 
 impl CacheEntry {
     fn is_resolving(&self) -> bool {
-        if let Self::Resolving(_) = self {
-            true
-        } else {
-            false
-        }
+matches!(self, Self::Resolving(_))
     }
 }
 
@@ -457,7 +453,7 @@ fn ensure_additional_cache_space(
             .expect("cache is empty but stored entries were expected");
         if peek.1.is_resolving() {
             // this is a resolving entry, we don't want to pop it.
-            let id = peek.0.clone();
+            let id = *peek.0;
             cache.promote(&id);
             continue;
         }
@@ -550,7 +546,7 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
                 match lookup {
                     Ok(bytes) => {
                         if ensure_enough_cache_space(
-                            &mut *cache,
+                            &mut cache,
                             self.limit_bytes(),
                             &self.current,
                             bytes.len(),
@@ -562,12 +558,12 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
                             self.current.fetch_add(bytes.len(), Ordering::Relaxed);
                         } else {
                             // this entry is uncachable. Just remove the resolving entry
-                            drop_from_cache(&mut *cache, id, &self.current);
+                            drop_from_cache(&mut cache, id, &self.current);
                         }
                         Ok(bytes)
                     }
                     Err(e) => {
-                        drop_from_cache(&mut *cache, id, &self.current);
+                        drop_from_cache(&mut cache, id, &self.current);
 
                         Err(e)
                     }
@@ -595,12 +591,11 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
 
         let len = bytes.len();
         let mut cache = self.cache.lock().await;
-        if !cache.contains(&id) {
-            if ensure_enough_cache_space(&mut *cache, self.limit_bytes(), &self.current, len) {
+        if !cache.contains(&id)
+            && ensure_enough_cache_space(&mut cache, self.limit_bytes(), &self.current, len) {
                 cache.put(id, CacheEntry::Resolved(bytes));
                 self.current.fetch_add(len, Ordering::Relaxed);
             }
-        }
 
         Ok(())
     }
@@ -750,11 +745,7 @@ impl ConstructionFile {
 
     fn is_finalized(&self) -> bool {
         let guard = self.0.read().unwrap();
-        if let ConstructionFileState::Finalized(_) = &*guard {
-            true
-        } else {
-            false
-        }
+matches!(&*guard, ConstructionFileState::Finalized(_))
     }
 
     fn finalized_buf(self) -> Bytes {
@@ -788,8 +779,7 @@ impl AsyncWrite for ConstructionFile {
 
                 Poll::Ready(Ok(buf.len()))
             }
-            _ => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
+            _ => Poll::Ready(Err(io::Error::other(
                 "file already written",
             ))),
         }
@@ -828,7 +818,7 @@ impl SyncableFile for ConstructionFile {
             }
             _ => {
                 *guard = state;
-                Err(io::Error::new(io::ErrorKind::Other, "file already written"))
+                Err(io::Error::other("file already written"))
             }
         }
     }
@@ -852,8 +842,7 @@ impl AsyncRead for ConstructionFile {
 
                 Poll::Ready(Ok(()))
             }
-            _ => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
+            _ => Poll::Ready(Err(io::Error::other(
                 "file not yet written",
             ))),
         }
@@ -1131,7 +1120,7 @@ impl AsyncRead for ArchiveSliceReader {
 
         let before_len = buf.filled().len();
         let read = AsyncRead::poll_read(Pin::new(&mut self.file), cx, buf);
-        if let Poll::Pending = read {
+        if read.is_pending() {
             return Poll::Pending;
         }
 
@@ -1292,8 +1281,8 @@ impl<M: ArchiveMetadataBackend + Unpin> SyncableFile for ArchiveRollupFileWriter
         let rollup_string =
             String::from_utf8(self.data.to_vec()).expect("rollup id was not a string");
         // first line of this string is going to be a version number. it should be discarded.
-        let line = rollup_string.lines().skip(1).next().unwrap();
-        let rollup_id = string_to_name(&line)?;
+        let line = rollup_string.lines().nth(1).unwrap();
+        let rollup_id = string_to_name(line)?;
 
         self.metadata_backend
             .set_rollup(self.layer_id, rollup_id)

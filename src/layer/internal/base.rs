@@ -178,9 +178,9 @@ impl<F: 'static + FileLoad + FileStore + Clone> BaseLayerFileBuilder<F> {
     ///
     /// Panics if the given node string is not a lexical successor of the previous node string.
     pub fn add_node(&mut self, node: &str) -> u64 {
-        let id = self.builder.add_node(node);
+        
 
-        id
+        self.builder.add_node(node)
     }
 
     pub fn add_node_bytes(&mut self, node: Bytes) -> u64 {
@@ -191,9 +191,9 @@ impl<F: 'static + FileLoad + FileStore + Clone> BaseLayerFileBuilder<F> {
     ///
     /// Panics if the given predicate string is not a lexical successor of the previous node string.
     pub fn add_predicate(&mut self, predicate: &str) -> u64 {
-        let id = self.builder.add_predicate(predicate);
+        
 
-        id
+        self.builder.add_predicate(predicate)
     }
 
     pub fn add_predicate_bytes(&mut self, predicate: Bytes) -> u64 {
@@ -204,83 +204,78 @@ impl<F: 'static + FileLoad + FileStore + Clone> BaseLayerFileBuilder<F> {
     ///
     /// Panics if the given value string is not a lexical successor of the previous value string.
     pub fn add_value(&mut self, value: TypedDictEntry) -> u64 {
-        let id = self.builder.add_value(value);
+        
 
-        id
+        self.builder.add_value(value)
     }
 
     /// Add nodes from an iterable.
     ///
     /// Panics if the nodes are not in lexical order, or if previous added nodes are a lexical succesor of any of these nodes.
-    pub fn add_nodes<I: 'static + IntoIterator<Item = String> + Send>(
+    pub fn add_nodes<I: 'static + IntoIterator<Item = String> + Send + Unpin + Sync>(
         &mut self,
         nodes: I,
     ) -> Vec<u64>
     where
         <I as std::iter::IntoIterator>::IntoIter: Unpin + Send + Sync,
-        I: Unpin + Sync,
     {
-        let ids = self.builder.add_nodes(nodes);
+        
 
-        ids
+        self.builder.add_nodes(nodes)
     }
 
-    pub fn add_nodes_bytes<I: 'static + IntoIterator<Item = Bytes> + Send>(
+    pub fn add_nodes_bytes<I: 'static + IntoIterator<Item = Bytes> + Send + Unpin + Sync>(
         &mut self,
         nodes: I,
     ) -> Vec<u64>
     where
         <I as std::iter::IntoIterator>::IntoIter: Unpin + Send + Sync,
-        I: Unpin + Sync,
     {
-        let ids = self.builder.add_nodes_bytes(nodes);
+        
 
-        ids
+        self.builder.add_nodes_bytes(nodes)
     }
 
     /// Add predicates from an iterable.
     ///
     /// Panics if the predicates are not in lexical order, or if previous added predicates are a lexical succesor of any of these predicates.
-    pub fn add_predicates<I: 'static + IntoIterator<Item = String> + Send>(
+    pub fn add_predicates<I: 'static + IntoIterator<Item = String> + Send + Unpin + Sync>(
         &mut self,
         predicates: I,
     ) -> Vec<u64>
     where
         <I as std::iter::IntoIterator>::IntoIter: Unpin + Send + Sync,
-        I: Unpin + Sync,
     {
-        let ids = self.builder.add_predicates(predicates);
+        
 
-        ids
+        self.builder.add_predicates(predicates)
     }
 
-    pub fn add_predicates_bytes<I: 'static + IntoIterator<Item = Bytes> + Send>(
+    pub fn add_predicates_bytes<I: 'static + IntoIterator<Item = Bytes> + Send + Unpin + Sync>(
         &mut self,
         predicates: I,
     ) -> Vec<u64>
     where
         <I as std::iter::IntoIterator>::IntoIter: Unpin + Send + Sync,
-        I: Unpin + Sync,
     {
-        let ids = self.builder.add_predicates_bytes(predicates);
+        
 
-        ids
+        self.builder.add_predicates_bytes(predicates)
     }
 
     /// Add values from an iterable.
     ///
     /// Panics if the values are not in lexical order, or if previous added values are a lexical succesor of any of these values.
-    pub fn add_values<I: 'static + IntoIterator<Item = TypedDictEntry> + Send>(
+    pub fn add_values<I: 'static + IntoIterator<Item = TypedDictEntry> + Send + Unpin + Sync>(
         &mut self,
         values: I,
     ) -> Vec<u64>
     where
         <I as std::iter::IntoIterator>::IntoIter: Unpin + Send + Sync,
-        I: Unpin + Sync,
     {
-        let ids = self.builder.add_values(values);
+        
 
-        ids
+        self.builder.add_values(values)
     }
 
     /// Turn this builder into a phase 2 builder that will take triple data.
