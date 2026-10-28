@@ -1,7 +1,6 @@
 use std::env;
 
 use terminus_store::*;
-use tokio;
 
 #[tokio::main]
 async fn main() {

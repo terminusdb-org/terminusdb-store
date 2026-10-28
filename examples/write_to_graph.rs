@@ -3,7 +3,6 @@ use std::env;
 use lazy_static::lazy_static;
 use regex::Regex;
 use terminus_store::*;
-use tokio;
 use tokio::io::{self, AsyncBufReadExt};
 
 enum Command {
@@ -56,7 +55,7 @@ async fn process_commands(store_path: &str, graph: &str) -> io::Result<()> {
     let graph = store
         .open(graph)
         .await?
-        .expect(&format!("expected graph {} to exist", graph));
+        .unwrap_or_else(|| panic!("expected graph {} to exist", graph));
 
     // There are two types of builders. One creates a new base layer,
     // which has no parent. The other creates a child layer, which has
@@ -69,7 +68,7 @@ async fn process_commands(store_path: &str, graph: &str) -> io::Result<()> {
 
     while let Some(line) = stdin.next_line().await? {
         let segment = line.trim();
-        if segment.len() == 0 {
+        if segment.is_empty() {
             continue;
         }
 

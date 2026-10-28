@@ -56,9 +56,9 @@ impl<F: 'static + FileLoad + FileStore> DictionarySetFileBuilder<F> {
     }
 
     pub fn add_node_bytes(&mut self, node: Bytes) -> u64 {
-        let id = self.node_dictionary_builder.add(node);
+        
 
-        id
+        self.node_dictionary_builder.add(node)
     }
 
     /// Add a predicate string.
@@ -73,18 +73,18 @@ impl<F: 'static + FileLoad + FileStore> DictionarySetFileBuilder<F> {
     }
 
     pub fn add_predicate_bytes(&mut self, predicate: Bytes) -> u64 {
-        let id = self.predicate_dictionary_builder.add(predicate);
+        
 
-        id
+        self.predicate_dictionary_builder.add(predicate)
     }
 
     /// Add a value string.
     ///
     /// Panics if the given value string is not a lexical successor of the previous value string.
     pub fn add_value(&mut self, value: TypedDictEntry) -> u64 {
-        let id = self.value_dictionary_builder.add(value);
+        
 
-        id
+        self.value_dictionary_builder.add(value)
     }
 
     /// Add nodes from an iterable.
@@ -387,14 +387,14 @@ pub async fn build_object_index_from_direct_files<
         greatest_sp = sp;
         pairs.push((object, sp));
         tally += 1;
-        if tally % 10000000 == 0 {
+        if tally.is_multiple_of(10000000) {
             chrono_log!(
                 "collected {tally} pairs for o_ps index ({}%)",
                 (tally * 100 / count)
             );
         }
 
-        if tally % SINGLE_SORT_LIMIT == 0 {
+        if tally.is_multiple_of(SINGLE_SORT_LIMIT) {
             chrono_log!("collect currently gathered elements into a logarray");
             pairs.par_sort_unstable();
             let mut sp_file = BytesMut::with_capacity(0);
@@ -470,7 +470,7 @@ pub async fn build_object_index_from_direct_files<
         let mut objects = Vec::new();
         let mut last_object = 0;
         let mut object_ix = 0;
-        while let Some((object, sp)) = merged_iters.next() {
+        for (object, sp) in merged_iters.by_ref() {
             if object > last_object {
                 object_ix += 1;
                 last_object = object;

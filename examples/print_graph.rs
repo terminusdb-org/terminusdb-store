@@ -3,40 +3,36 @@ use std::env;
 use std::io;
 use tdb_succinct::TdbDataType;
 use terminus_store::*;
-use tokio;
 
 async fn print_graph(store_path: &str, graph: &str) -> io::Result<()> {
     let store = open_directory_store(store_path);
     let graph = store
         .open(graph)
         .await?
-        .expect(&format!("expected graph {} to exist", graph));
+        .unwrap_or_else(|| panic!("expected graph {} to exist", graph));
 
-    match graph.head().await? {
-        Some(layer) => {
-            for id_triple in layer.triples() {
-                // triples are retrieved in their id form. For printing,
-                // we need the string form. The conversion happens here.
-                let triple = layer
-                    .id_triple_to_string(&id_triple)
-                    .expect("expected id triple to be mapable to string");
+    if let Some(layer) = graph.head().await? {
+        for id_triple in layer.triples() {
+            // triples are retrieved in their id form. For printing,
+            // we need the string form. The conversion happens here.
+            let triple = layer
+                .id_triple_to_string(&id_triple)
+                .expect("expected id triple to be mapable to string");
 
-                println!(
-                    "{}, {}, {} {:?}",
-                    triple.subject,
-                    triple.predicate,
-                    match triple.object {
-                        ObjectType::Node(_) => "node",
-                        ObjectType::Value(_) => "value",
-                    },
-                    match triple.object {
-                        ObjectType::Node(n) => String::make_entry(&n),
-                        ObjectType::Value(v) => v,
-                    }
-                );
-            }
+            println!(
+                "{}, {}, {} {:?}",
+                triple.subject,
+                triple.predicate,
+                match triple.object {
+                    ObjectType::Node(_) => "node",
+                    ObjectType::Value(_) => "value",
+                },
+                match triple.object {
+                    ObjectType::Node(n) => String::make_entry(&n),
+                    ObjectType::Value(v) => v,
+                }
+            );
         }
-        None => {}
     }
 
     Ok(())
