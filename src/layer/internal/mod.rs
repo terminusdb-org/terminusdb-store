@@ -10,7 +10,8 @@ use super::id_map::*;
 use super::layer::*;
 use tdb_succinct::*;
 
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use std::convert::TryInto;
 
 pub use base::*;
@@ -29,6 +30,454 @@ pub enum InternalLayer {
 
 use tfc::block::IdLookupResult;
 use InternalLayer::*;
+
+/// One band's prefix range: a front-coded dict position walked forward
+/// while the name carries the prefix. `base` is the cumulative id-space
+/// size of all parent bands, turning inner positions into global ids.
+/// Successor of a string in dict order: increment the last non-max char.
+/// UTF-8 byte order preserves code-point order, so every extension of
+/// `prefix` sorts before its successor, making the successor the exclusive
+/// upper bound of the prefix range. `None` means no successor exists
+/// (empty or all-max-char input) and the range runs to the end.
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(&last) = chars.last() {
+        if last == char::MAX {
+            chars.pop();
+            continue;
+        }
+        let mut c = last as u32 + 1;
+        while c <= char::MAX as u32 {
+            if let Some(next) = char::from_u32(c) {
+                chars.pop();
+                chars.push(next);
+                return Some(chars.into_iter().collect());
+            }
+            c += 1;
+        }
+        chars.pop();
+    }
+    None
+}
+
+/// First position in `dict` whose entry is >= `key` (lower bound).
+///
+/// `StringDict::id` only approximates the insertion point: `Closest` can
+/// point at a block boundary below the true bound, and `NotFound` only
+/// means the key precedes the first block head or the dict is empty. The
+/// seek is refined by walking forward while entries still sort below the
+/// key, which stays within a block of work.
+fn dict_lower_bound(dict: &StringDict, len: u64, key: &str) -> u64 {
+    let key_owned = key.to_string();
+    let mut pos = match dict.id(&key_owned) {
+        IdLookupResult::Found(i) => i,
+        IdLookupResult::Closest(i) => i + 1,
+        IdLookupResult::NotFound => 1,
+    };
+    while pos <= len {
+        match dict.get(pos as usize) {
+            Some(entry) if entry.as_str() < key => pos += 1,
+            _ => break,
+        }
+    }
+    // Guard against Closest landing above the insertion point.
+    while pos > 1 {
+        match dict.get((pos - 1) as usize) {
+            Some(entry) if entry.as_str() >= key => pos -= 1,
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// Lazily decode one (edge band, object, side) member-run slice. The
+/// subject-sorted run is bisected to `[s_lo, s_hi)` once, then walked
+/// forward yielding `(subject, sign)` for entries matching `predicate`.
+/// For a wavelet-mapped name band the slice covers the band's whole
+/// subject space and each subject's inner position is checked against
+/// `[a_lo, a_hi)`.
+///
+/// `subjects`/`objects` are the edge band's index arrays; `None` means the
+/// array position is the id itself.
+struct MemberSlice {
+    subjects: Option<MonotonicLogArray>,
+    s_p: AdjacencyList,
+    o_ps: AdjacencyList,
+    predicate: u64,
+    sign: i64,
+    pos: u64,
+    end: u64,
+    a_map: Option<IdMap>,
+    a_base: u64,
+    a_lo: u64,
+    a_hi: u64,
+}
+
+impl MemberSlice {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        subjects: Option<MonotonicLogArray>,
+        objects: Option<MonotonicLogArray>,
+        o_ps: AdjacencyList,
+        s_p: AdjacencyList,
+        object: u64,
+        s_lo: u64,
+        s_hi: u64,
+        predicate: u64,
+        sign: i64,
+        a_map: Option<IdMap>,
+        a_base: u64,
+        a_lo: u64,
+        a_hi: u64,
+    ) -> Option<Self> {
+        // 0-based index of `object` in the band's object space.
+        let o_pos = match &objects {
+            Some(objects) => {
+                let pos = objects.nearest_index_of(object);
+                if pos >= objects.len() || objects.entry(pos) != object {
+                    return None;
+                }
+                pos
+            }
+            None => {
+                if object == 0 || object > o_ps.left_count() as u64 {
+                    return None;
+                }
+                (object - 1) as usize
+            }
+        };
+        let left = o_pos as u64 + 1;
+        let run_lo = o_ps.offset_for(left);
+        let run_hi = if left == o_ps.left_count() as u64 {
+            o_ps.right_count() as u64
+        } else {
+            o_ps.offset_for(left + 1)
+        };
+        if run_lo >= run_hi {
+            return None;
+        }
+
+        // Subject bounds as 1-based mapped-subject positions (or raw ids
+        // when the band has no subjects array).
+        let (ms_lo, ms_hi) = match &subjects {
+            Some(subjects) => (
+                subjects.nearest_index_of(s_lo) as u64 + 1,
+                subjects.nearest_index_of(s_hi) as u64 + 1,
+            ),
+            None => (s_lo, s_hi),
+        };
+        if ms_lo >= ms_hi {
+            return None;
+        }
+
+        // shortcut: pair_num 0 is run-tail padding and reads as
+        // below-bound; mid-run padding would break the bisect — revisit
+        // if the format ever allows padding inside a run.
+        let mapped_at = |pos: u64| -> u64 {
+            let pair_num = o_ps.num_at_pos(pos);
+            if pair_num == 0 {
+                0
+            } else {
+                s_p.left_at_pos(pair_num - 1)
+            }
+        };
+        let bisect = |bound: u64| -> u64 {
+            let mut lo = run_lo;
+            let mut hi = run_hi;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if mapped_at(mid) < bound {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        let start = bisect(ms_lo);
+        let end = bisect(ms_hi);
+        if start >= end {
+            return None;
+        }
+
+        Some(Self {
+            subjects,
+            s_p,
+            o_ps,
+            predicate,
+            sign,
+            pos: start,
+            end,
+            a_map,
+            a_base,
+            a_lo,
+            a_hi,
+        })
+    }
+}
+
+impl Iterator for MemberSlice {
+    type Item = (u64, i64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.pos < self.end {
+            let pair_num = self.o_ps.num_at_pos(self.pos);
+            self.pos += 1;
+            if pair_num == 0 {
+                continue;
+            }
+            let (mapped_subject, predicate) = self.s_p.pair_at_pos(pair_num - 1);
+            if predicate != self.predicate {
+                continue;
+            }
+            let subject = match &self.subjects {
+                Some(subjects) => subjects.entry(mapped_subject as usize - 1),
+                None => mapped_subject,
+            };
+            if let Some(map) = &self.a_map {
+                let inner = map.outer_to_inner(subject - self.a_base);
+                if inner < self.a_lo || inner >= self.a_hi {
+                    continue;
+                }
+            }
+            return Some((subject, self.sign));
+        }
+        None
+    }
+}
+
+/// Merge one name band's member slices by subject id, yielding
+/// `(subject, net)` for subjects with net membership > 0 — a subject's
+/// events arrive grouped since every slice is subject-sorted.
+struct BandMembers {
+    slices: Vec<std::iter::Peekable<MemberSlice>>,
+    heap: BinaryHeap<(Reverse<u64>, usize)>,
+}
+
+impl BandMembers {
+    fn new(slices: Vec<MemberSlice>) -> Self {
+        let mut slices: Vec<std::iter::Peekable<MemberSlice>> =
+            slices.into_iter().map(|s| s.peekable()).collect();
+        let mut heap = BinaryHeap::new();
+        for (i, slice) in slices.iter_mut().enumerate() {
+            if let Some((subject, _)) = slice.peek() {
+                heap.push((Reverse(*subject), i));
+            }
+        }
+        BandMembers { slices, heap }
+    }
+}
+
+impl Iterator for BandMembers {
+    type Item = (u64, i64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (Reverse(subject), idx) = self.heap.pop()?;
+            let (_, sign) = self.slices[idx].next().unwrap();
+            let mut net = sign;
+            if let Some((next_subject, _)) = self.slices[idx].peek() {
+                self.heap.push((Reverse(*next_subject), idx));
+            }
+            while matches!(self.heap.peek(), Some((Reverse(s), _)) if *s == subject) {
+                let (_, dup_idx) = self.heap.pop().unwrap();
+                let (_, sign) = self.slices[dup_idx].next().unwrap();
+                net += sign;
+                if let Some((next_subject, _)) = self.slices[dup_idx].peek() {
+                    self.heap.push((Reverse(*next_subject), dup_idx));
+                }
+            }
+            if net > 0 {
+                return Some((subject, net));
+            }
+        }
+    }
+}
+
+/// One band's prefix range: `lo..hi` are dictionary positions of names
+/// carrying the prefix, `base` the band's offset in the combined
+/// node+value id space. `identity` bands assign `outer = base + inner`
+/// so the prefix maps to a contiguous outer range; wavelet (rollup)
+/// bands permute it.
+struct PrefixBand {
+    base: u64,
+    node_len: u64,
+    val_len: u64,
+    lo: u64,
+    hi: u64,
+    identity: bool,
+}
+
+/// The per-band prefix dictionary ranges for `layers`.
+fn prefix_band_ranges(layers: &[&InternalLayer], prefix: &str) -> Vec<PrefixBand> {
+    let end_key = prefix_successor(prefix);
+    let mut bands = Vec::with_capacity(layers.len());
+    let mut base = 0u64;
+    for layer in layers.iter() {
+        let node_len = layer.node_dict_len() as u64;
+        let val_len = layer.value_dict_len() as u64;
+        let node_dict = layer.node_dictionary();
+        let lo = dict_lower_bound(node_dict, node_len, prefix);
+        let hi = match end_key.as_ref() {
+            Some(end_key) => dict_lower_bound(node_dict, node_len, end_key),
+            None => node_len + 1,
+        };
+        bands.push(PrefixBand {
+            base,
+            node_len,
+            val_len,
+            lo,
+            hi,
+            identity: layer.node_value_id_map().id_wtree.is_none(),
+        });
+        base += node_len + val_len;
+    }
+    bands
+}
+
+/// The member slices joining name band `a_idx` with every edge band at or
+/// above it: positive and negative runs of each object in `objects`.
+fn member_slices(
+    layers: &[&InternalLayer],
+    bands: &[PrefixBand],
+    a_idx: usize,
+    predicate: u64,
+    objects: &HashSet<u64>,
+) -> Vec<MemberSlice> {
+    let a = &bands[a_idx];
+    let (s_lo, s_hi) = if a.identity {
+        (a.base + a.lo, a.base + a.hi)
+    } else {
+        (a.base + 1, a.base + a.node_len + a.val_len + 1)
+    };
+    let a_map = if a.identity {
+        None
+    } else {
+        Some(layers[a_idx].node_value_id_map().clone())
+    };
+    let mut slices = Vec::new();
+    for band in layers.iter().skip(a_idx) {
+        for (subjects, band_objects, o_ps, s_p, sign) in [
+            (
+                band.pos_subjects(),
+                band.pos_objects(),
+                Some(band.pos_o_ps_adjacency_list()),
+                Some(band.pos_s_p_adjacency_list()),
+                1i64,
+            ),
+            (
+                band.neg_subjects(),
+                band.neg_objects(),
+                band.neg_o_ps_adjacency_list(),
+                band.neg_s_p_adjacency_list(),
+                -1i64,
+            ),
+        ] {
+            let (o_ps, s_p) = match (o_ps, s_p) {
+                (Some(o_ps), Some(s_p)) => (o_ps, s_p),
+                _ => continue,
+            };
+            for object in objects {
+                if let Some(slice) = MemberSlice::new(
+                    subjects.cloned(),
+                    band_objects.cloned(),
+                    o_ps.clone(),
+                    s_p.clone(),
+                    *object,
+                    s_lo,
+                    s_hi,
+                    predicate,
+                    sign,
+                    a_map.clone(),
+                    a.base,
+                    a.lo,
+                    a.hi,
+                ) {
+                    slices.push(slice);
+                }
+            }
+        }
+    }
+    slices
+}
+
+struct BandPrefixCursor {
+    layer: InternalLayer,
+    base: u64,
+    pos: u64,
+    len: u64,
+    prefix: String,
+}
+
+impl Iterator for BandPrefixCursor {
+    type Item = (u64, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.pos <= self.len {
+            match self.layer.node_dict_get(self.pos as usize) {
+                Some(name) if name.starts_with(&self.prefix) => {
+                    let id = self.base + self.layer.node_value_id_map().inner_to_outer(self.pos);
+                    self.pos += 1;
+                    return Some((id, name));
+                }
+                _ => break,
+            }
+        }
+        None
+    }
+}
+
+/// K-way merge over per-band name-sorted sources. Each source yields
+/// (id, name) sorted by name, so a max-heap on (Reverse(name), rank,
+/// band) yields global name order lazily. Names present in several bands
+/// dedup to the topmost band's id: equal names pop in descending rank
+/// order, so the first pop wins and later occurrences are skipped.
+struct PrefixSubjects {
+    bands: Vec<(usize, std::iter::Peekable<Box<dyn Iterator<Item = (u64, String)> + Send>>)>,
+    heap: BinaryHeap<(Reverse<String>, usize, usize)>,
+}
+
+impl PrefixSubjects {
+    fn new(
+        mut bands: Vec<(
+            usize,
+            std::iter::Peekable<Box<dyn Iterator<Item = (u64, String)> + Send>>,
+        )>,
+    ) -> Self {
+        let mut heap = BinaryHeap::new();
+        for (i, (rank, band)) in bands.iter_mut().enumerate() {
+            if let Some((_, name)) = band.peek() {
+                heap.push((Reverse(name.clone()), *rank, i));
+            }
+        }
+        PrefixSubjects { bands, heap }
+    }
+
+    fn refresh(&mut self, idx: usize) {
+        let (rank, band) = &mut self.bands[idx];
+        if let Some((_, name)) = band.peek() {
+            self.heap.push((Reverse(name.clone()), *rank, idx));
+        }
+    }
+}
+
+impl Iterator for PrefixSubjects {
+    type Item = (u64, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (Reverse(name), _, idx) = self.heap.pop()?;
+        let (id, _) = self.bands[idx].1.next().unwrap();
+        self.refresh(idx);
+
+        while matches!(self.heap.peek(), Some((Reverse(n), _, _)) if *n == name) {
+            let (_, _, dup_idx) = self.heap.pop().unwrap();
+            self.bands[dup_idx].1.next();
+            self.refresh(dup_idx);
+        }
+
+        Some((id, name))
+    }
+}
 
 impl InternalLayer {
     pub fn name(&self) -> [u32; 5] {
@@ -667,6 +1116,7 @@ impl InternalLayer {
     pub fn is_rollup(&self) -> bool {
 matches!(self, Rollup(_))
     }
+
 }
 
 impl Layer for InternalLayer {
@@ -792,6 +1242,120 @@ impl Layer for InternalLayer {
         }
 
         None
+    }
+
+    fn subjects_with_prefix(&self, prefix: &str) -> Box<dyn Iterator<Item = (u64, String)> + Send> {
+        let mut bands = Vec::new();
+        let mut parent_count = 0u64;
+        let prefix = prefix.to_string();
+        for (rank, layer) in self.immediate_layers().into_iter().enumerate() {
+            let node_dict_len = layer.node_dict_len() as u64;
+            let value_dict_len = layer.value_dict_len() as u64;
+
+            let node_dict = layer.node_dictionary();
+            let start = dict_lower_bound(node_dict, node_dict_len, &prefix);
+
+            let cursor = BandPrefixCursor {
+                layer: layer.clone(),
+                base: parent_count,
+                pos: start,
+                len: node_dict_len,
+                prefix: prefix.clone(),
+            };
+            bands.push((
+                rank,
+                (Box::new(cursor) as Box<dyn Iterator<Item = (u64, String)> + Send>).peekable(),
+            ));
+            parent_count += node_dict_len + value_dict_len;
+        }
+
+        Box::new(PrefixSubjects::new(bands))
+    }
+
+    fn count_subjects_with_prefix(&self, prefix: &str) -> usize {
+        // Band dictionaries contain only names introduced in that band, so a
+        // subject name occurs in exactly one band. The per-band prefix ranges
+        // are therefore disjoint and the count is the sum of range lengths.
+        let end_key = prefix_successor(prefix);
+        let prefix_owned = prefix.to_string();
+        let mut count = 0usize;
+        for layer in self.immediate_layers() {
+            let node_dict = layer.node_dictionary();
+            let len = layer.node_dict_len() as u64;
+            let start = dict_lower_bound(node_dict, len, &prefix_owned);
+            let end = match end_key.as_ref() {
+                Some(end_key) => dict_lower_bound(node_dict, len, end_key),
+                None => len + 1,
+            };
+            if end > start {
+                count += (end - start) as usize;
+            }
+        }
+        count
+    }
+
+    fn count_triple_subjects_with_prefix(
+        &self,
+        prefix: &str,
+        predicate: u64,
+        objects: &std::collections::HashSet<u64>,
+    ) -> usize {
+        let layers = self.immediate_layers();
+        let bands = prefix_band_ranges(&layers, prefix);
+        bands
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.lo < a.hi)
+            .map(|(a_idx, _)| {
+                BandMembers::new(member_slices(&layers, &bands, a_idx, predicate, objects)).count()
+            })
+            .sum()
+    }
+
+    fn triple_subjects_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        predicate: u64,
+        objects: &'a std::collections::HashSet<u64>,
+    ) -> Box<dyn Iterator<Item = (u64, String)> + Send + 'a> {
+        let layers = self.immediate_layers();
+        let bands = prefix_band_ranges(&layers, prefix);
+        let mut sources = Vec::new();
+        for (a_idx, a) in bands.iter().enumerate() {
+            if a.lo >= a.hi {
+                continue;
+            }
+            let members = BandMembers::new(member_slices(&layers, &bands, a_idx, predicate, objects));
+            let layer = layers[a_idx].clone();
+            let base = a.base;
+            let source: Box<dyn Iterator<Item = (u64, String)> + Send> = if a.identity {
+                // outer = base + dict position, so members arrive in
+                // name order and the name is a direct dict lookup.
+                Box::new(members.filter_map(move |(subject, _net)| {
+                    layer
+                        .node_dict_get((subject - base) as usize)
+                        .map(|name| (subject, name))
+                }))
+            } else {
+                // shortcut: wavelet bands permute outer ids, so members
+                // arrive out of name order — buffer and sort this band
+                // (bounded by members in the band; upgrade to an
+                // external merge if rollup bands get huge).
+                let map = layer.node_value_id_map().clone();
+                let mut items: Vec<(u64, String)> = members
+                    .filter_map(|(subject, _net)| {
+                        let inner = map.outer_to_inner(subject - base);
+                        layer
+                            .node_dict_get(inner as usize)
+                            .map(|name| (subject, name))
+                    })
+                    .collect();
+                items.sort_by(|x, y| x.1.cmp(&y.1));
+                Box::new(items.into_iter())
+            };
+            sources.push((a_idx, source.peekable()));
+        }
+        Box::new(PrefixSubjects::new(sources))
     }
 
     fn id_predicate(&self, id: u64) -> Option<String> {
@@ -1719,6 +2283,187 @@ mod tests {
             1,
             layer.count_triples_value_range(Some(cow), Some(says), &low, &high)
         );
+    }
+
+    fn create_typed_docs_base_layer(store: &SyncStore) -> SyncStoreLayer {
+        let builder = store.create_base_layer().unwrap();
+
+        for triple in [
+            ValueTriple::new_node("doc/1", "rdf:type", "Type"),
+            ValueTriple::new_node("doc/2", "rdf:type", "Type"),
+            ValueTriple::new_node("doc/2", "links", "Type"),
+            ValueTriple::new_node("doc/3", "rdf:type", "Type"),
+            ValueTriple::new_node("other/1", "rdf:type", "Type"),
+            ValueTriple::new_node("doc/1", "rdf:type", "Other"),
+        ] {
+            builder.add_value_triple(triple).unwrap();
+        }
+
+        builder.commit().unwrap()
+    }
+
+    #[test]
+    fn count_typed_prefix_base_layer() {
+        let store = open_sync_memory_store();
+        let layer = create_typed_docs_base_layer(&store);
+
+        let rdf_type = layer.predicate_id("rdf:type").unwrap();
+        let type_obj = layer.object_node_id("Type").unwrap();
+        let other_obj = layer.object_node_id("Other").unwrap();
+
+        let types: HashSet<u64> = vec![type_obj].into_iter().collect();
+        // doc/1, doc/2, doc/3 have a type edge; other/1 is out of range and
+        // doc/2's "links" edge to the same object must not count.
+        assert_eq!(
+            3,
+            layer.count_triple_subjects_with_prefix("doc/", rdf_type, &types)
+        );
+        assert_eq!(
+            1,
+            layer.count_triple_subjects_with_prefix("other/", rdf_type, &types)
+        );
+        assert_eq!(
+            0,
+            layer.count_triple_subjects_with_prefix("zzz/", rdf_type, &types)
+        );
+
+        // doc/1 is a member of both objects but counts once.
+        let both: HashSet<u64> = vec![type_obj, other_obj].into_iter().collect();
+        assert_eq!(
+            3,
+            layer.count_triple_subjects_with_prefix("doc/", rdf_type, &both)
+        );
+
+        // the streaming form yields members in name order
+        let names: Vec<String> = layer
+            .triple_subjects_with_prefix("doc/", rdf_type, &types)
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(vec!["doc/1", "doc/2", "doc/3"], names);
+    }
+
+    #[test]
+    fn count_typed_prefix_child_layer() {
+        let store = open_sync_memory_store();
+        let base = create_typed_docs_base_layer(&store);
+        let builder = base.open_write().unwrap();
+
+        for triple in [
+            // new names typed in the child band
+            ValueTriple::new_node("doc/4", "rdf:type", "Type"),
+            ValueTriple::new_node("doc/5", "rdf:type", "Type"),
+            // a base-band name typed in the child band
+            ValueTriple::new_node("doc/2", "rdf:type", "Other"),
+        ] {
+            builder.add_value_triple(triple).unwrap();
+        }
+        builder
+            .remove_value_triple(ValueTriple::new_node("doc/3", "rdf:type", "Type"))
+            .unwrap();
+
+        let layer = builder.commit().unwrap();
+
+        let rdf_type = layer.predicate_id("rdf:type").unwrap();
+        let type_obj = layer.object_node_id("Type").unwrap();
+        let other_obj = layer.object_node_id("Other").unwrap();
+
+        let types: HashSet<u64> = vec![type_obj].into_iter().collect();
+        // doc/1, doc/2, doc/4, doc/5; doc/3's edge was removed, other/1 is
+        // out of range.
+        assert_eq!(
+            4,
+            layer.count_triple_subjects_with_prefix("doc/", rdf_type, &types)
+        );
+        assert_eq!(
+            1,
+            layer.count_triple_subjects_with_prefix("other/", rdf_type, &types)
+        );
+        assert_eq!(
+            0,
+            layer.count_triple_subjects_with_prefix("zzz/", rdf_type, &types)
+        );
+
+        // doc/1 (Type+Other), doc/2 (Type+Other across bands), doc/4, doc/5.
+        let both: HashSet<u64> = vec![type_obj, other_obj].into_iter().collect();
+        assert_eq!(
+            4,
+            layer.count_triple_subjects_with_prefix("doc/", rdf_type, &both)
+        );
+
+        // the streaming form yields surviving members in name order —
+        // doc/3's removal nets it out.
+        let names: Vec<String> = layer
+            .triple_subjects_with_prefix("doc/", rdf_type, &types)
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(vec!["doc/1", "doc/2", "doc/4", "doc/5"], names);
+    }
+
+    #[test]
+    fn count_typed_prefix_subject_range_skips_unrelated_objects() {
+        let store = open_sync_memory_store();
+        let layer = create_typed_docs_base_layer(&store);
+
+        let rdf_type = layer.predicate_id("rdf:type").unwrap();
+        let other_obj = layer.object_node_id("Other").unwrap();
+
+        // only doc/1 is an instance of Other in range; the Type members do
+        // not leak in even though they share the prefix.
+        let types: HashSet<u64> = vec![other_obj].into_iter().collect();
+        assert_eq!(
+            1,
+            layer.count_triple_subjects_with_prefix("doc/", rdf_type, &types)
+        );
+    }
+
+    #[test]
+    fn subjects_with_prefix_matches_linear_scan() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+
+        // Four name families dense enough to span several front-coded
+        // dict blocks, so prefixes land mid-block.
+        let mut all: Vec<String> = Vec::new();
+        for fam in ["aa", "ab", "ba", "zz"] {
+            for i in 0..50u32 {
+                all.push(format!("{fam}/{i:03}"));
+            }
+        }
+        for name in &all {
+            builder
+                .add_value_triple(ValueTriple::new_node(name, "p", "other/n"))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap();
+        all.push("other/n".to_string());
+        all.sort();
+        all.dedup();
+
+        let mut prefixes: HashSet<String> = all
+            .iter()
+            .flat_map(|n| (1..=n.len()).map(move |l| n[..l].to_string()))
+            .collect();
+        for p in ["", "a", "ac", "a0", "c", "o", "y", "zzz", "aa/999"] {
+            prefixes.insert(p.to_string());
+        }
+
+        for prefix in prefixes {
+            let want: Vec<String> = all
+                .iter()
+                .filter(|n| n.starts_with(&prefix))
+                .cloned()
+                .collect();
+            let got: Vec<String> = layer
+                .subjects_with_prefix(&prefix)
+                .map(|(_, name)| name)
+                .collect();
+            assert_eq!(want, got, "subjects_with_prefix({prefix:?})");
+            assert_eq!(
+                want.len(),
+                layer.count_subjects_with_prefix(&prefix),
+                "count_subjects_with_prefix({prefix:?})"
+            );
+        }
     }
 
     #[tokio::test]

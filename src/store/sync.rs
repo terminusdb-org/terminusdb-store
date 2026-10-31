@@ -400,6 +400,34 @@ impl Layer for SyncStoreLayer {
         self.inner.id_subject(id)
     }
 
+    fn subjects_with_prefix(&self, prefix: &str) -> Box<dyn Iterator<Item = (u64, String)> + Send> {
+        self.inner.subjects_with_prefix(prefix)
+    }
+
+    fn count_subjects_with_prefix(&self, prefix: &str) -> usize {
+        self.inner.count_subjects_with_prefix(prefix)
+    }
+
+    fn count_triple_subjects_with_prefix(
+        &self,
+        prefix: &str,
+        predicate: u64,
+        objects: &std::collections::HashSet<u64>,
+    ) -> usize {
+        self.inner
+            .count_triple_subjects_with_prefix(prefix, predicate, objects)
+    }
+
+    fn triple_subjects_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        predicate: u64,
+        objects: &'a std::collections::HashSet<u64>,
+    ) -> Box<dyn Iterator<Item = (u64, String)> + Send + 'a> {
+        self.inner
+            .triple_subjects_with_prefix(prefix, predicate, objects)
+    }
+
     fn id_predicate(&self, id: u64) -> Option<String> {
         self.inner.id_predicate(id)
     }
