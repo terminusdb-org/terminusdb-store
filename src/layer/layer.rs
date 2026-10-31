@@ -32,6 +32,72 @@ pub trait Layer: Send + Sync {
     /// The subject corresponding to a numerical id, or None if it cannot be found.
     fn id_subject(&self, id: u64) -> Option<String>;
 
+    /// The subjects whose name starts with `prefix`, as (subject id, name)
+    /// pairs. Node names live in a sorted front-coded dictionary per layer
+    /// band, so a prefix is a contiguous dictionary range. Names are
+    /// yielded in sorted order, deduplicated across bands; the yielded id
+    /// is the topmost band's.
+    fn subjects_with_prefix(&self, prefix: &str) -> Box<dyn Iterator<Item = (u64, String)> + Send>;
+
+    /// Count the subjects whose name starts with the given prefix.
+    ///
+    /// The default implementation counts via `subjects_with_prefix`.
+    /// `InternalLayer` overrides this with per-band dictionary seeks: child
+    /// dictionaries only contain newly introduced names, so band ranges are
+    /// disjoint and the count is a sum of range lengths.
+    fn count_subjects_with_prefix(&self, prefix: &str) -> usize {
+        self.subjects_with_prefix(prefix).count()
+    }
+
+    /// Count distinct subjects of triples matching (subject, predicate,
+    /// object in `objects`) whose name starts with `prefix`.
+    ///
+    /// The default implementation enumerates the prefix range and probes
+    /// `triple_exists` per (subject, object) pair. `InternalLayer` overrides
+    /// this with a member-side scan: each member's outer id locates its home
+    /// band, `outer_to_inner` gives the dictionary position, and a numeric
+    /// range check decides membership — no names are materialized.
+    fn count_triple_subjects_with_prefix(
+        &self,
+        prefix: &str,
+        predicate: u64,
+        objects: &std::collections::HashSet<u64>,
+    ) -> usize {
+        self.subjects_with_prefix(prefix)
+            .filter(|(subject, _)| {
+                objects
+                    .iter()
+                    .any(|o| self.triple_exists(*subject, predicate, *o))
+            })
+            .count()
+    }
+
+    /// The subjects named under `prefix` that carry a `(subject,
+    /// predicate, object in objects)` triple, as (subject id, name)
+    /// pairs in name order — the streaming form of
+    /// `count_triple_subjects_with_prefix`.
+    ///
+    /// The default implementation probes `triple_exists` per candidate.
+    /// `InternalLayer` overrides this with a merge-join over the bands'
+    /// subject-sorted member runs: each name band's member slices merge
+    /// by subject id (itself the dict position order), then the bands
+    /// merge by name — no membership set is materialized.
+    fn triple_subjects_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        predicate: u64,
+        objects: &'a std::collections::HashSet<u64>,
+    ) -> Box<dyn Iterator<Item = (u64, String)> + Send + 'a> {
+        Box::new(
+            self.subjects_with_prefix(prefix)
+                .filter(move |(subject, _)| {
+                    objects
+                        .iter()
+                        .any(|o| self.triple_exists(*subject, predicate, *o))
+                }),
+        )
+    }
+
     /// The predicate corresponding to a numerical id, or None if it cannot be found.
     fn id_predicate(&self, id: u64) -> Option<String>;
     /// The object corresponding to a numerical id, or None if it cannot be found.
