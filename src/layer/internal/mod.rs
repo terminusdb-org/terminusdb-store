@@ -7,7 +7,7 @@ pub mod rollup;
 mod subject_iterator;
 
 use super::id_map::*;
-use super::layer::*;
+use super::traits::*;
 use tdb_succinct::tfc::interval::IntervalEndIndex;
 use tdb_succinct::tfc::lexical_interval::{
     posix_to_leap_aware_secs, AllenRelation, LexicalInterval, StartIdRanges,
@@ -29,9 +29,9 @@ pub use subject_iterator::*;
 
 #[derive(Clone)]
 pub enum InternalLayer {
-    Base(BaseLayer),
-    Child(ChildLayer),
-    Rollup(RollupLayer),
+    Base(Box<BaseLayer>),
+    Child(Box<ChildLayer>),
+    Rollup(Box<RollupLayer>),
 }
 
 use chrono::{Datelike, NaiveDateTime};
@@ -62,9 +62,7 @@ enum AxisCmp {
 
 fn rbound_of_start(c: &tdb_succinct::tfc::lexical_interval::Component) -> RBound {
     match tdb_succinct::tfc::lexical_interval::start_bound_class(c) {
-        tdb_succinct::tfc::lexical_interval::BoundClass::Finite(s, n, l) => {
-            RBound::Finite(s, n, l)
-        }
+        tdb_succinct::tfc::lexical_interval::BoundClass::Finite(s, n, l) => RBound::Finite(s, n, l),
         tdb_succinct::tfc::lexical_interval::BoundClass::Open => RBound::Neg,
         tdb_succinct::tfc::lexical_interval::BoundClass::Null => RBound::Null,
     }
@@ -72,9 +70,7 @@ fn rbound_of_start(c: &tdb_succinct::tfc::lexical_interval::Component) -> RBound
 
 fn rbound_of_end(c: &tdb_succinct::tfc::lexical_interval::Component) -> RBound {
     match tdb_succinct::tfc::lexical_interval::end_bound_class(c) {
-        tdb_succinct::tfc::lexical_interval::BoundClass::Finite(s, n, l) => {
-            RBound::Finite(s, n, l)
-        }
+        tdb_succinct::tfc::lexical_interval::BoundClass::Finite(s, n, l) => RBound::Finite(s, n, l),
         tdb_succinct::tfc::lexical_interval::BoundClass::Open => RBound::Pos,
         tdb_succinct::tfc::lexical_interval::BoundClass::Null => RBound::Null,
     }
@@ -504,14 +500,14 @@ impl Iterator for BandPrefixCursor {
     type Item = (u64, String);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.pos <= self.len {
+        if self.pos <= self.len {
             match self.layer.node_dict_get(self.pos as usize) {
                 Some(name) if name.starts_with(&self.prefix) => {
                     let id = self.base + self.layer.node_value_id_map().inner_to_outer(self.pos);
                     self.pos += 1;
                     return Some((id, name));
                 }
-                _ => break,
+                _ => {}
             }
         }
         None
@@ -523,21 +519,15 @@ impl Iterator for BandPrefixCursor {
 /// band) yields global name order lazily. Names present in several bands
 /// dedup to the topmost band's id: equal names pop in descending rank
 /// order, so the first pop wins and later occurrences are skipped.
+type BandSource = std::iter::Peekable<Box<dyn Iterator<Item = (u64, String)> + Send>>;
+
 struct PrefixSubjects {
-    bands: Vec<(
-        usize,
-        std::iter::Peekable<Box<dyn Iterator<Item = (u64, String)> + Send>>,
-    )>,
+    bands: Vec<(usize, BandSource)>,
     heap: BinaryHeap<(Reverse<String>, usize, usize)>,
 }
 
 impl PrefixSubjects {
-    fn new(
-        mut bands: Vec<(
-            usize,
-            std::iter::Peekable<Box<dyn Iterator<Item = (u64, String)> + Send>>,
-        )>,
-    ) -> Self {
+    fn new(mut bands: Vec<(usize, BandSource)>) -> Self {
         let mut heap = BinaryHeap::new();
         for (i, (rank, band)) in bands.iter_mut().enumerate() {
             if let Some((_, name)) = band.peek() {
@@ -2239,19 +2229,19 @@ impl Layer for InternalLayer {
 
 impl From<BaseLayer> for InternalLayer {
     fn from(layer: BaseLayer) -> InternalLayer {
-        InternalLayer::Base(layer)
+        InternalLayer::Base(Box::new(layer))
     }
 }
 
 impl From<ChildLayer> for InternalLayer {
     fn from(layer: ChildLayer) -> InternalLayer {
-        InternalLayer::Child(layer)
+        InternalLayer::Child(Box::new(layer))
     }
 }
 
 impl From<RollupLayer> for InternalLayer {
     fn from(layer: RollupLayer) -> InternalLayer {
-        InternalLayer::Rollup(layer)
+        InternalLayer::Rollup(Box::new(layer))
     }
 }
 
@@ -3030,7 +3020,7 @@ mod interval_relation_tests {
         "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z",
         "2025-01-01T00:00:00Z/2025-12-31T00:00:00Z",
         "2025-04-01T00:00:00Z/2025-04-01T00:00:00Z", // point reference
-        "2025-04-01T00:00:00Z",                    // bare instant -> [t,t)
+        "2025-04-01T00:00:00Z",                      // bare instant -> [t,t)
         "../2025-04-01T00:00:00Z",
         "2025-01-01T00:00:00Z/..",
         "../..",
@@ -3105,18 +3095,14 @@ mod interval_relation_tests {
             .add_value_triple(ValueTriple {
                 subject: "sub/c".to_string(),
                 predicate: "p".to_string(),
-                object: ObjectType::Value(iv_entry(
-                    "2025-04-01T00:00:00Z/2025-05-01T00:00:00Z",
-                )),
+                object: ObjectType::Value(iv_entry("2025-04-01T00:00:00Z/2025-05-01T00:00:00Z")),
             })
             .unwrap();
         child
             .add_value_triple(ValueTriple {
                 subject: "sub/c2".to_string(),
                 predicate: "p".to_string(),
-                object: ObjectType::Value(iv_entry(
-                    "2026-01-01T00:00:00Z/2026-04-01T00:00:00Z",
-                )),
+                object: ObjectType::Value(iv_entry("2026-01-01T00:00:00Z/2026-04-01T00:00:00Z")),
             })
             .unwrap();
         child
@@ -3173,7 +3159,10 @@ mod interval_relation_tests {
                 assert!(
                     missing.is_empty(),
                     "{:?} vs {}: truth ids {:?} missing from candidates {:?}",
-                    rel, ref_str, missing, candidates
+                    rel,
+                    ref_str,
+                    missing,
+                    candidates
                 );
             }
         }
@@ -3287,8 +3276,7 @@ mod interval_relation_tests {
         let name = child2.commit().unwrap().name();
         let layer = store.get_layer_from_id(name).unwrap().unwrap();
 
-        let reference =
-            literal_as_interval("2025-01-01T00:00:00Z/2025-10-01T00:00:00Z").unwrap();
+        let reference = literal_as_interval("2025-01-01T00:00:00Z/2025-10-01T00:00:00Z").unwrap();
         let candidates: HashSet<u64> = layer
             .interval_relation_object_ids(AllenRelation::During, &reference)
             .into_iter()
@@ -3302,13 +3290,16 @@ mod interval_relation_tests {
             candidates
         );
 
-        let starts_ref =
-            literal_as_interval("2025-04-01T00:00:00Z/2025-12-31T00:00:00Z").unwrap();
+        let starts_ref = literal_as_interval("2025-04-01T00:00:00Z/2025-12-31T00:00:00Z").unwrap();
         let starts: HashSet<u64> = layer
             .interval_relation_object_ids(AllenRelation::Starts, &starts_ref)
             .into_iter()
             .collect();
-        assert!(starts.contains(&q2), "starts candidate missing: {:?}", starts);
+        assert!(
+            starts.contains(&q2),
+            "starts candidate missing: {:?}",
+            starts
+        );
 
         let triples: Vec<_> = layer
             .triples_interval_relation(AllenRelation::During, &reference)
@@ -3324,13 +3315,13 @@ mod interval_relation_tests {
 
 #[cfg(test)]
 mod interval_dict_encoding_tests {
-    use crate::layer::layer::Layer;
+    use crate::layer::Layer;
     use crate::store::sync::*;
     use crate::ValueTriple;
     use bytes::Bytes;
     use tdb_succinct::tfc::block::SizedDictEntry;
     use tdb_succinct::tfc::lexical_interval::{
-        encode_lexical_interval, lexical_interval_entry, legacy_interval_to_lexical,
+        encode_lexical_interval, legacy_interval_to_lexical, lexical_interval_entry,
         parse_lexical_interval,
     };
     use tdb_succinct::*;
@@ -3396,28 +3387,26 @@ mod interval_dict_encoding_tests {
             .unwrap()
             .and_utc()
             .timestamp();
-        let canonical = lexical_interval_entry(&legacy_interval_to_lexical(
-            &DateTimeInterval {
-                start_seconds: secs,
-                start_nanos: 0,
-                end_seconds: secs,
-                end_nanos: 0,
-                start_type: INTERVAL_COMPONENT_DATETIME,
-                end_type: INTERVAL_COMPONENT_DATETIME,
-                flag: INTERVAL_FLAG_EXPLICIT,
-                duration: Duration {
-                    sign: 1,
-                    year: 0,
-                    month: 0,
-                    day: 0,
-                    hour: 0,
-                    minute: 0,
-                    second: 0.0,
-                },
-                start_tz: 0,
-                end_tz: 0,
+        let canonical = lexical_interval_entry(&legacy_interval_to_lexical(&DateTimeInterval {
+            start_seconds: secs,
+            start_nanos: 0,
+            end_seconds: secs,
+            end_nanos: 0,
+            start_type: INTERVAL_COMPONENT_DATETIME,
+            end_type: INTERVAL_COMPONENT_DATETIME,
+            flag: INTERVAL_FLAG_EXPLICIT,
+            duration: Duration {
+                sign: 1,
+                year: 0,
+                month: 0,
+                day: 0,
+                hour: 0,
+                minute: 0,
+                second: 0.0,
             },
-        ));
+            start_tz: 0,
+            end_tz: 0,
+        }));
 
         // the stored entry was upgraded to lexical bytes at commit/load
         let stored = layer.id_object(2).expect("object 2 exists");
@@ -3429,8 +3418,10 @@ mod interval_dict_encoding_tests {
         // canonical lookup hits; legacy fixed-width lookup misses
         assert!(layer.object_value_id(&canonical).is_some());
         assert!(layer.object_value_id(&fixed).is_none());
-        assert_eq!(layer.object_value_id(&iv_entry("2020-01-15T12:30:45Z/2020-01-15T12:30:45Z")),
-                 layer.object_value_id(&canonical));
+        assert_eq!(
+            layer.object_value_id(&iv_entry("2020-01-15T12:30:45Z/2020-01-15T12:30:45Z")),
+            layer.object_value_id(&canonical)
+        );
     }
 }
 

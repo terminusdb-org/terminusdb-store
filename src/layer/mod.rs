@@ -6,10 +6,10 @@
 pub mod builder;
 pub mod id_map;
 mod internal;
-mod layer;
 mod simple_builder;
+mod traits;
 
 pub use id_map::*;
 pub use internal::*;
-pub use layer::*;
 pub use simple_builder::*;
+pub use traits::*;

@@ -10,7 +10,7 @@
 //! memory, then does the required sorting and id conversion on
 //! commit.
 use super::internal::*;
-use super::layer::*;
+use super::traits::*;
 use crate::storage::*;
 use std::collections::HashMap;
 use std::io;
