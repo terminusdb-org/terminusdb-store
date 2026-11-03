@@ -218,12 +218,8 @@ pub trait Layer: Send + Sync {
                 continue;
             }
             if let Some(ObjectType::Value(e)) = self.id_object(t.object) {
-                if let Some(iv) =
-                    tdb_succinct::tfc::lexical_interval::entry_relation_bounds(&e)
-                {
-                    if tdb_succinct::tfc::lexical_interval::interval_relation(
-                        &iv, rel, reference,
-                    ) {
+                if let Some(iv) = tdb_succinct::tfc::lexical_interval::entry_relation_bounds(&e) {
+                    if tdb_succinct::tfc::lexical_interval::interval_relation(&iv, rel, reference) {
                         out.push(t.object);
                     }
                 }
@@ -242,7 +238,11 @@ pub trait Layer: Send + Sync {
     ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
         let object_ids = self.interval_relation_object_ids(rel, reference);
         let layer = self.clone_boxed();
-        Box::new(object_ids.into_iter().flat_map(move |oid| layer.triples_o(oid)))
+        Box::new(
+            object_ids
+                .into_iter()
+                .flat_map(move |oid| layer.triples_o(oid)),
+        )
     }
 
     /// Convert all known strings in the given string triple to ids.
@@ -344,8 +344,7 @@ pub trait Layer: Send + Sync {
 
         self.triples_value_range(low, high)
             .filter(move |t| {
-                subject.is_none_or(|s| t.subject == s)
-                    && predicate.is_none_or(|p| t.predicate == p)
+                subject.is_none_or(|s| t.subject == s) && predicate.is_none_or(|p| t.predicate == p)
             })
             .count()
     }

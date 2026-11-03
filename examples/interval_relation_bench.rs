@@ -33,7 +33,11 @@ fn iv_entry(s: &str) -> TypedDictEntry {
 
 /// Scan truth: decode every triple's object and evaluate — the pre-index
 /// query path.
-fn scan_candidates(layer: &SyncStoreLayer, rel: AllenRelation, reference: &LexicalInterval) -> usize {
+fn scan_candidates(
+    layer: &SyncStoreLayer,
+    rel: AllenRelation,
+    reference: &LexicalInterval,
+) -> usize {
     let mut n = 0;
     for t in layer.triples() {
         if let Some(ObjectType::Value(e)) = layer.id_object(t.object) {

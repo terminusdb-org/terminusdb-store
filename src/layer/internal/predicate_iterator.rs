@@ -83,7 +83,8 @@ impl Iterator for InternalLayerTriplePredicateIterator {
         // set the sp_boundary flag, ensuring that upon the subsequent
         // next() call, we move on to the next predicate.
         let next = self.subject_iterator.peek();
-        self.sp_boundary = next.is_none() || next.map(|t| (t.subject, t.predicate)) != result.map(|t| (t.subject, t.predicate));
+        self.sp_boundary = next.is_none()
+            || next.map(|t| (t.subject, t.predicate)) != result.map(|t| (t.subject, t.predicate));
 
         result
     }
