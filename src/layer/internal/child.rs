@@ -183,7 +183,7 @@ impl ChildLayer {
             neg_predicate_wavelet_tree_width,
         );
 
-        InternalLayer::Child(ChildLayer {
+        InternalLayer::Child(Box::new(ChildLayer {
             name,
             parent,
 
@@ -216,7 +216,7 @@ impl ChildLayer {
             interval_index,
 
             stored_size,
-        })
+        }))
     }
 }
 

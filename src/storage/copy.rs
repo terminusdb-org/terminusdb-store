@@ -1,7 +1,7 @@
 use std::io;
 
-use super::{BaseLayerFiles, ChildLayerFiles, FileLoad, FileStore, IdMapFiles};
 use super::IntervalIndexFiles;
+use super::{BaseLayerFiles, ChildLayerFiles, FileLoad, FileStore, IdMapFiles};
 
 use tdb_succinct::storage::copy_file;
 

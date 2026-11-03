@@ -47,7 +47,16 @@ fn main() {
     let n6 = layer.count_triples(None, None, None);
     let d_idx_all = t.elapsed();
 
-    println!("(s,p,_):   iterate {:>8?} ({})  indexed {:>8?} ({})", d_iter_sp, n1, d_idx_sp, n2);
-    println!("(_,p,_):   iterate {:>8?} ({})  indexed {:>8?} ({})", d_iter_p, n3, d_idx_p, n4);
-    println!("(_,_,_):   iterate {:>8?} ({})  indexed {:>8?} ({})", d_iter_all, n5, d_idx_all, n6);
+    println!(
+        "(s,p,_):   iterate {:>8?} ({})  indexed {:>8?} ({})",
+        d_iter_sp, n1, d_idx_sp, n2
+    );
+    println!(
+        "(_,p,_):   iterate {:>8?} ({})  indexed {:>8?} ({})",
+        d_iter_p, n3, d_idx_p, n4
+    );
+    println!(
+        "(_,_,_):   iterate {:>8?} ({})  indexed {:>8?} ({})",
+        d_iter_all, n5, d_idx_all, n6
+    );
 }

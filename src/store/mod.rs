@@ -137,12 +137,10 @@ impl StoreLayerBuilder {
         }
 
         match builder {
-            None => {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "builder has already been committed",
-                ))
-            }
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "builder has already been committed",
+            )),
             Some(builder) => {
                 let id = builder.name();
                 builder.commit_boxed().await?;

@@ -4,4 +4,4 @@
 //
 
 #[macro_use]
-pub mod logging;
+pub mod sinks;

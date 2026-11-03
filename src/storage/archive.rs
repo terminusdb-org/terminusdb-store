@@ -355,11 +355,14 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
     }
 }
 
+#[cfg(feature = "rollup_metadata_experimental")]
+type RollupCache = std::sync::RwLock<HashMap<[u32; 5], Option<[u32; 5]>>>;
+
 #[derive(Clone)]
 pub struct LruArchiveBackend<M, D> {
     cache: Arc<tokio::sync::Mutex<LruCache<[u32; 5], CacheEntry>>>,
     #[cfg(feature = "rollup_metadata_experimental")]
-    rollup_cache: Arc<std::sync::RwLock<HashMap<[u32; 5], Option<[u32; 5]>>>>,
+    rollup_cache: Arc<RollupCache>,
     limit: usize,
     current: Arc<AtomicUsize>,
     metadata_origin: M,
@@ -374,7 +377,7 @@ enum CacheEntry {
 
 impl CacheEntry {
     fn is_resolving(&self) -> bool {
-matches!(self, Self::Resolving(_))
+        matches!(self, Self::Resolving(_))
     }
 }
 
@@ -592,10 +595,11 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
         let len = bytes.len();
         let mut cache = self.cache.lock().await;
         if !cache.contains(&id)
-            && ensure_enough_cache_space(&mut cache, self.limit_bytes(), &self.current, len) {
-                cache.put(id, CacheEntry::Resolved(bytes));
-                self.current.fetch_add(len, Ordering::Relaxed);
-            }
+            && ensure_enough_cache_space(&mut cache, self.limit_bytes(), &self.current, len)
+        {
+            cache.put(id, CacheEntry::Resolved(bytes));
+            self.current.fetch_add(len, Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -745,7 +749,7 @@ impl ConstructionFile {
 
     fn is_finalized(&self) -> bool {
         let guard = self.0.read().unwrap();
-matches!(&*guard, ConstructionFileState::Finalized(_))
+        matches!(&*guard, ConstructionFileState::Finalized(_))
     }
 
     fn finalized_buf(self) -> Bytes {
@@ -779,9 +783,7 @@ impl AsyncWrite for ConstructionFile {
 
                 Poll::Ready(Ok(buf.len()))
             }
-            _ => Poll::Ready(Err(io::Error::other(
-                "file already written",
-            ))),
+            _ => Poll::Ready(Err(io::Error::other("file already written"))),
         }
     }
 
@@ -842,9 +844,7 @@ impl AsyncRead for ConstructionFile {
 
                 Poll::Ready(Ok(()))
             }
-            _ => Poll::Ready(Err(io::Error::other(
-                "file not yet written",
-            ))),
+            _ => Poll::Ready(Err(io::Error::other("file not yet written"))),
         }
     }
 }

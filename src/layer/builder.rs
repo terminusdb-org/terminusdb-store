@@ -4,7 +4,7 @@ use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
 use rayon::prelude::*;
 
-use super::layer::*;
+use super::traits::*;
 use crate::{chrono_log, storage::*};
 use tdb_succinct::util::{heap_sorted_iter, stream_iter_ok};
 use tdb_succinct::*;

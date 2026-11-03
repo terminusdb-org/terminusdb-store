@@ -10,7 +10,7 @@
 //! memory, then does the required sorting and id conversion on
 //! commit.
 use super::internal::*;
-use super::layer::*;
+use super::traits::*;
 use crate::storage::*;
 use std::collections::HashMap;
 use std::io;
@@ -566,11 +566,8 @@ mod tests {
         builder.add_value_triple(ValueTriple::new_string_value("crow", "says", "caw"));
 
         builder.commit().await.unwrap();
-        let base_layer: Arc<InternalLayer> = Arc::new(
-            BaseLayer::load_from_files(name, &files)
-                .await
-                .unwrap(),
-        );
+        let base_layer: Arc<InternalLayer> =
+            Arc::new(BaseLayer::load_from_files(name, &files).await.unwrap());
 
         assert!(
             !base_layer.value_triple_exists(&ValueTriple::new_string_value("crow", "says", "caw"))
@@ -587,11 +584,8 @@ mod tests {
         builder.remove_value_triple(ValueTriple::new_string_value("crow", "says", "caw"));
 
         builder.commit().await.unwrap();
-        let base_layer: Arc<InternalLayer> = Arc::new(
-            BaseLayer::load_from_files(name, &files)
-                .await
-                .unwrap(),
-        );
+        let base_layer: Arc<InternalLayer> =
+            Arc::new(BaseLayer::load_from_files(name, &files).await.unwrap());
 
         assert!(
             !base_layer.value_triple_exists(&ValueTriple::new_string_value("crow", "says", "caw"))

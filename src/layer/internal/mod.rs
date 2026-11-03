@@ -7,7 +7,7 @@ pub mod rollup;
 mod subject_iterator;
 
 use super::id_map::*;
-use super::layer::*;
+use super::traits::*;
 use tdb_succinct::tfc::interval::IntervalEndIndex;
 use tdb_succinct::tfc::lexical_interval::{
     posix_to_leap_aware_secs, AllenRelation, LexicalInterval, StartIdRanges,
@@ -29,9 +29,9 @@ pub use subject_iterator::*;
 
 #[derive(Clone)]
 pub enum InternalLayer {
-    Base(BaseLayer),
-    Child(ChildLayer),
-    Rollup(RollupLayer),
+    Base(Box<BaseLayer>),
+    Child(Box<ChildLayer>),
+    Rollup(Box<RollupLayer>),
 }
 
 use chrono::{Datelike, NaiveDateTime};
@@ -62,9 +62,7 @@ enum AxisCmp {
 
 fn rbound_of_start(c: &tdb_succinct::tfc::lexical_interval::Component) -> RBound {
     match tdb_succinct::tfc::lexical_interval::start_bound_class(c) {
-        tdb_succinct::tfc::lexical_interval::BoundClass::Finite(s, n, l) => {
-            RBound::Finite(s, n, l)
-        }
+        tdb_succinct::tfc::lexical_interval::BoundClass::Finite(s, n, l) => RBound::Finite(s, n, l),
         tdb_succinct::tfc::lexical_interval::BoundClass::Open => RBound::Neg,
         tdb_succinct::tfc::lexical_interval::BoundClass::Null => RBound::Null,
     }
@@ -72,9 +70,7 @@ fn rbound_of_start(c: &tdb_succinct::tfc::lexical_interval::Component) -> RBound
 
 fn rbound_of_end(c: &tdb_succinct::tfc::lexical_interval::Component) -> RBound {
     match tdb_succinct::tfc::lexical_interval::end_bound_class(c) {
-        tdb_succinct::tfc::lexical_interval::BoundClass::Finite(s, n, l) => {
-            RBound::Finite(s, n, l)
-        }
+        tdb_succinct::tfc::lexical_interval::BoundClass::Finite(s, n, l) => RBound::Finite(s, n, l),
         tdb_succinct::tfc::lexical_interval::BoundClass::Open => RBound::Pos,
         tdb_succinct::tfc::lexical_interval::BoundClass::Null => RBound::Null,
     }
@@ -504,14 +500,14 @@ impl Iterator for BandPrefixCursor {
     type Item = (u64, String);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.pos <= self.len {
+        if self.pos <= self.len {
             match self.layer.node_dict_get(self.pos as usize) {
                 Some(name) if name.starts_with(&self.prefix) => {
                     let id = self.base + self.layer.node_value_id_map().inner_to_outer(self.pos);
                     self.pos += 1;
                     return Some((id, name));
                 }
-                _ => break,
+                _ => {}
             }
         }
         None
@@ -523,21 +519,15 @@ impl Iterator for BandPrefixCursor {
 /// band) yields global name order lazily. Names present in several bands
 /// dedup to the topmost band's id: equal names pop in descending rank
 /// order, so the first pop wins and later occurrences are skipped.
+type BandSource = std::iter::Peekable<Box<dyn Iterator<Item = (u64, String)> + Send>>;
+
 struct PrefixSubjects {
-    bands: Vec<(
-        usize,
-        std::iter::Peekable<Box<dyn Iterator<Item = (u64, String)> + Send>>,
-    )>,
+    bands: Vec<(usize, BandSource)>,
     heap: BinaryHeap<(Reverse<String>, usize, usize)>,
 }
 
 impl PrefixSubjects {
-    fn new(
-        mut bands: Vec<(
-            usize,
-            std::iter::Peekable<Box<dyn Iterator<Item = (u64, String)> + Send>>,
-        )>,
-    ) -> Self {
+    fn new(mut bands: Vec<(usize, BandSource)>) -> Self {
         let mut heap = BinaryHeap::new();
         for (i, (rank, band)) in bands.iter_mut().enumerate() {
             if let Some((_, name)) = band.peek() {
@@ -1340,6 +1330,10 @@ impl InternalLayer {
         use AxisCmp::*;
         let (s_cmps, e_cmp): (Vec<AxisCmp>, Option<AxisCmp>) = match rel {
             AllenRelation::Before => (vec![], Some(Lt(ys))),
+            // Point reference [t,t): on-or-after — a stored interval
+            // starting at the instant is a candidate (`Ge`, not `Gt`),
+            // matching the verifier's `be <= as` arm.
+            AllenRelation::After if ys == ye => (vec![Ge(ye)], None),
             AllenRelation::After => (vec![Gt(ye)], None),
             AllenRelation::Meets => (vec![], Some(Eq(ys))),
             AllenRelation::MetBy => (vec![Eq(ye)], None),
@@ -1354,7 +1348,9 @@ impl InternalLayer {
             // instant belongs to the interval it starts (`xs <= t < xe`) —
             // while a true interval reference stays strict.
             AllenRelation::Contains if ys == ye => (vec![Le(ys)], Some(Gt(ye))),
-            AllenRelation::Contains => (vec![Lt(ys)], Some(Gt(ye))),
+            // Coverage semantics: contains counts boundary-sharing spans
+            // too (`Le`/`Ge` candidates for the verifier's `<=` checks).
+            AllenRelation::Contains => (vec![Le(ys)], Some(Ge(ye))),
             AllenRelation::Finishes => (vec![Gt(ys)], Some(Eq(ye))),
             AllenRelation::FinishedBy => (vec![Lt(ys)], Some(Eq(ye))),
             AllenRelation::Equals => (vec![Eq(ys)], Some(Eq(ye))),
@@ -2233,19 +2229,19 @@ impl Layer for InternalLayer {
 
 impl From<BaseLayer> for InternalLayer {
     fn from(layer: BaseLayer) -> InternalLayer {
-        InternalLayer::Base(layer)
+        InternalLayer::Base(Box::new(layer))
     }
 }
 
 impl From<ChildLayer> for InternalLayer {
     fn from(layer: ChildLayer) -> InternalLayer {
-        InternalLayer::Child(layer)
+        InternalLayer::Child(Box::new(layer))
     }
 }
 
 impl From<RollupLayer> for InternalLayer {
     fn from(layer: RollupLayer) -> InternalLayer {
-        InternalLayer::Rollup(layer)
+        InternalLayer::Rollup(Box::new(layer))
     }
 }
 
@@ -3024,7 +3020,7 @@ mod interval_relation_tests {
         "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z",
         "2025-01-01T00:00:00Z/2025-12-31T00:00:00Z",
         "2025-04-01T00:00:00Z/2025-04-01T00:00:00Z", // point reference
-        "2025-04-01T00:00:00Z",                    // bare instant -> [t,t)
+        "2025-04-01T00:00:00Z",                      // bare instant -> [t,t)
         "../2025-04-01T00:00:00Z",
         "2025-01-01T00:00:00Z/..",
         "../..",
@@ -3099,18 +3095,14 @@ mod interval_relation_tests {
             .add_value_triple(ValueTriple {
                 subject: "sub/c".to_string(),
                 predicate: "p".to_string(),
-                object: ObjectType::Value(iv_entry(
-                    "2025-04-01T00:00:00Z/2025-05-01T00:00:00Z",
-                )),
+                object: ObjectType::Value(iv_entry("2025-04-01T00:00:00Z/2025-05-01T00:00:00Z")),
             })
             .unwrap();
         child
             .add_value_triple(ValueTriple {
                 subject: "sub/c2".to_string(),
                 predicate: "p".to_string(),
-                object: ObjectType::Value(iv_entry(
-                    "2026-01-01T00:00:00Z/2026-04-01T00:00:00Z",
-                )),
+                object: ObjectType::Value(iv_entry("2026-01-01T00:00:00Z/2026-04-01T00:00:00Z")),
             })
             .unwrap();
         child
@@ -3167,7 +3159,10 @@ mod interval_relation_tests {
                 assert!(
                     missing.is_empty(),
                     "{:?} vs {}: truth ids {:?} missing from candidates {:?}",
-                    rel, ref_str, missing, candidates
+                    rel,
+                    ref_str,
+                    missing,
+                    candidates
                 );
             }
         }
@@ -3230,6 +3225,202 @@ mod interval_relation_tests {
             candidates2.contains(&q2),
             "seam interval missing via entry-derived reference {:?}",
             candidates2
+        );
+    }
+
+    // Delta-layer repro for the WOQL `during` miss: interval values live on
+    // a child layer over a committed base, exactly where document inserts
+    // land. Both the object-id candidates and the full triple iterator must
+    // surface the strictly-inside interval.
+    #[test]
+    fn interval_relation_during_on_delta_layer() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let store = open_sync_directory_store(dir.path());
+        let base = store.create_base_layer().unwrap();
+        base.add_value_triple(ValueTriple::new_node("x", "y", "z"))
+            .unwrap();
+        let base_layer = base.commit().unwrap();
+
+        let child = base_layer.open_write().unwrap();
+        for (i, o) in [
+            "2024-01-01/2024-06-30",
+            "2024-07-01/2024-12-31",
+            "2025-01-01/2025-03-31",
+            "2025-04-01/2025-06-30",
+            "2025-07-01/2025-09-30",
+        ]
+        .iter()
+        .enumerate()
+        {
+            child
+                .add_value_triple(ValueTriple {
+                    subject: format!("sub/{i}"),
+                    predicate: "p".to_string(),
+                    object: ObjectType::Value(iv_entry(o)),
+                })
+                .unwrap();
+        }
+        // a string value in the same dict puts the interval segment at a
+        // non-zero type offset, as on a real database
+        child
+            .add_value_triple(ValueTriple::new_string_value("sub/0", "name", "q1"))
+            .unwrap();
+        let committed = child.commit().unwrap();
+        // second commit on top — the instance head on a real database is
+        // this deep (schema commit, then instance commit)
+        let child2 = committed.open_write().unwrap();
+        child2
+            .add_value_triple(ValueTriple::new_node("a", "b", "c"))
+            .unwrap();
+        let name = child2.commit().unwrap().name();
+        let layer = store.get_layer_from_id(name).unwrap().unwrap();
+
+        let reference = literal_as_interval("2025-01-01T00:00:00Z/2025-10-01T00:00:00Z").unwrap();
+        let candidates: HashSet<u64> = layer
+            .interval_relation_object_ids(AllenRelation::During, &reference)
+            .into_iter()
+            .collect();
+        let q2 = layer
+            .object_value_id(&iv_entry("2025-04-01/2025-06-30"))
+            .unwrap();
+        assert!(
+            candidates.contains(&q2),
+            "during candidate missing on delta layer: {:?}",
+            candidates
+        );
+
+        let starts_ref = literal_as_interval("2025-04-01T00:00:00Z/2025-12-31T00:00:00Z").unwrap();
+        let starts: HashSet<u64> = layer
+            .interval_relation_object_ids(AllenRelation::Starts, &starts_ref)
+            .into_iter()
+            .collect();
+        assert!(
+            starts.contains(&q2),
+            "starts candidate missing: {:?}",
+            starts
+        );
+
+        let triples: Vec<_> = layer
+            .triples_interval_relation(AllenRelation::During, &reference)
+            .collect();
+        assert!(
+            triples.iter().any(|t| t.object == q2),
+            "triples_interval_relation missed {:?}: {:?}",
+            q2,
+            triples
+        );
+    }
+}
+
+#[cfg(test)]
+mod interval_dict_encoding_tests {
+    use crate::layer::Layer;
+    use crate::store::sync::*;
+    use crate::ValueTriple;
+    use bytes::Bytes;
+    use tdb_succinct::tfc::block::SizedDictEntry;
+    use tdb_succinct::tfc::lexical_interval::{
+        encode_lexical_interval, legacy_interval_to_lexical, lexical_interval_entry,
+        parse_lexical_interval,
+    };
+    use tdb_succinct::*;
+
+    fn iv_entry(s: &str) -> TypedDictEntry {
+        TypedDictEntry::new(
+            Datatype::DateTimeInterval,
+            SizedDictEntry::from(Bytes::from(encode_lexical_interval(
+                &parse_lexical_interval(s).unwrap(),
+            ))),
+        )
+    }
+
+    // Entry built the way the pre-fix store-prolog FFI marshaled it:
+    // struct fields -> DateTimeInterval::make_entry -> to_lexical (52 bytes).
+    fn fixed_width_entry() -> TypedDictEntry {
+        let secs = chrono::NaiveDate::from_ymd_opt(2020, 1, 15)
+            .unwrap()
+            .and_hms_opt(12, 30, 45)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        DateTimeInterval::make_entry(&DateTimeInterval {
+            start_seconds: secs,
+            start_nanos: 0,
+            end_seconds: secs,
+            end_nanos: 0,
+            start_type: INTERVAL_COMPONENT_DATETIME,
+            end_type: INTERVAL_COMPONENT_DATETIME,
+            flag: INTERVAL_FLAG_EXPLICIT,
+            duration: Duration {
+                sign: 1,
+                year: 0,
+                month: 0,
+                day: 0,
+                hour: 0,
+                minute: 0,
+                second: 0.0,
+            },
+            start_tz: 0,
+            end_tz: 0,
+        })
+    }
+
+    // Dict invariant: committed layers store interval values in lexical
+    // encoding (`upgrade_lexical_intervals` runs at layer load), so
+    // `object_value_id` only finds entries marshaled to that same canonical
+    // form. A fixed-width insert is upgraded to the identical lexical bytes,
+    // which is what makes mixed-encoding stores consistent.
+    #[test]
+    fn interval_lookup_requires_canonical_lexical_encoding() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        let fixed = fixed_width_entry();
+        builder
+            .add_value_triple(ValueTriple::new_value("s", "p", fixed.clone()))
+            .unwrap();
+        let layer = builder.commit().unwrap();
+
+        let secs = chrono::NaiveDate::from_ymd_opt(2020, 1, 15)
+            .unwrap()
+            .and_hms_opt(12, 30, 45)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let canonical = lexical_interval_entry(&legacy_interval_to_lexical(&DateTimeInterval {
+            start_seconds: secs,
+            start_nanos: 0,
+            end_seconds: secs,
+            end_nanos: 0,
+            start_type: INTERVAL_COMPONENT_DATETIME,
+            end_type: INTERVAL_COMPONENT_DATETIME,
+            flag: INTERVAL_FLAG_EXPLICIT,
+            duration: Duration {
+                sign: 1,
+                year: 0,
+                month: 0,
+                day: 0,
+                hour: 0,
+                minute: 0,
+                second: 0.0,
+            },
+            start_tz: 0,
+            end_tz: 0,
+        }));
+
+        // the stored entry was upgraded to lexical bytes at commit/load
+        let stored = layer.id_object(2).expect("object 2 exists");
+        assert_eq!(
+            stored.value_ref().map(|e| e.to_bytes()),
+            Some(canonical.to_bytes())
+        );
+
+        // canonical lookup hits; legacy fixed-width lookup misses
+        assert!(layer.object_value_id(&canonical).is_some());
+        assert!(layer.object_value_id(&fixed).is_none());
+        assert_eq!(
+            layer.object_value_id(&iv_entry("2020-01-15T12:30:45Z/2020-01-15T12:30:45Z")),
+            layer.object_value_id(&canonical)
         );
     }
 }

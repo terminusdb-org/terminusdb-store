@@ -7,7 +7,7 @@ use futures::task::{Context, Poll};
 
 use super::super::builder::*;
 use super::super::id_map::*;
-use super::super::layer::*;
+use super::super::traits::*;
 use crate::layer::InternalLayer;
 use crate::{chrono_log, storage::*};
 use tdb_succinct::tfc::interval::IntervalEndIndex;
@@ -138,7 +138,7 @@ impl BaseLayer {
             predicate_wavelet_tree_width,
         );
 
-        InternalLayer::Base(BaseLayer {
+        InternalLayer::Base(Box::new(BaseLayer {
             name,
             node_dictionary,
             predicate_dictionary,
@@ -160,7 +160,7 @@ impl BaseLayer {
             interval_index,
 
             stored_size,
-        })
+        }))
     }
 }
 
