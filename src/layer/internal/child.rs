@@ -93,7 +93,7 @@ impl ChildLayer {
                 ),
             ),
             None => IntervalEndIndex::build_lexical(&value_dictionary)
-                .expect("interval end index: entry outside representable rank domain"),
+                .expect("interval end index: malformed dictionary entry"),
         };
 
         let parent_node_value_count = parent.node_and_value_count();

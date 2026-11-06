@@ -524,6 +524,9 @@ pub async fn build_predicate_index<FLoad: 'static + FileLoad, F: 'static + FileL
     .await
 }
 
+/// Writes the interval end index files, or nothing when the dictionary
+/// holds an end outside the `(i64, u32)` rank domain — such layers open
+/// with the in-memory end index built from the dictionary itself.
 pub async fn build_interval_index<F: 'static + FileLoad + FileStore>(
     dict: &TypedDict,
     files: IntervalIndexFiles<F>,
@@ -536,6 +539,7 @@ pub async fn build_interval_index<F: 'static + FileLoad + FileStore>(
         files.wavelet_files.sblocks_file,
     )
     .await
+    .map(|_| ())
 }
 
 /// Build the interval end index over a value dictionary that lives in files

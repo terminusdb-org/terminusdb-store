@@ -81,7 +81,7 @@ impl BaseLayer {
                 ),
             ),
             None => IntervalEndIndex::build_lexical(&value_dictionary)
-                .expect("interval end index: entry outside representable rank domain"),
+                .expect("interval end index: malformed dictionary entry"),
         };
 
         let node_value_idmap = match maps.id_map_maps.node_value_idmap_maps {
