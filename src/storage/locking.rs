@@ -208,6 +208,14 @@ impl ExclusiveLockedFile {
         file.seek(pos).await
     }
 
+    pub async fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file
+            .as_ref()
+            .expect("tried to get metadata from dropped file")
+            .metadata()
+            .await
+    }
+
     pub async fn truncate(&mut self) -> io::Result<()> {
         let file = self
             .file
