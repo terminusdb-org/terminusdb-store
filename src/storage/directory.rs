@@ -44,7 +44,10 @@ impl PersistentLayerStore for DirectoryLayerStore {
                         "unexpected non-utf8 directory name",
                     )
                 })?;
-                result.push(string_to_name(name)?);
+                // skip non-layer dirs like the label store's `.tmp`
+                if let Ok(name) = string_to_name(name) {
+                    result.push(name);
+                }
             }
         }
 
@@ -120,8 +123,9 @@ pub struct DirectoryLabelStore {
     path: PathBuf,
 }
 
-/// `*.label.tmp` files older than this are crash residue — a live writer
-/// holds the label lock while its tmp exists, so a fresh tmp is never swept.
+/// `*.label` files in `.tmp/` older than this are crash residue — a live
+/// writer holds the label lock while its tmp exists, so a fresh tmp is never
+/// swept.
 const LABEL_TMP_TTL: Duration = Duration::from_secs(60);
 
 impl DirectoryLabelStore {
@@ -132,18 +136,23 @@ impl DirectoryLabelStore {
     }
 }
 
+/// Tmp files live in `<dir>/.tmp/` with the label's own name — a filename
+/// suffix would overflow NAME_MAX at the 255-byte db-name boundary.
+fn label_tmp_path(path: &Path, name: &str) -> PathBuf {
+    path.join(".tmp").join(format!("{name}.label"))
+}
+
 fn sweep_stale_label_tmps(path: &Path) {
-    let entries = match std::fs::read_dir(path) {
+    let tmp_dir = path.join(".tmp");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let entries = match std::fs::read_dir(tmp_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !name.ends_with(".label.tmp") {
+        if name.to_str().is_none() {
             continue;
         }
         let stale = entry
@@ -193,6 +202,32 @@ async fn fsync_parent_dir(dir: &Path) -> io::Result<()> {
         let _ = dir;
         Ok(())
     }
+}
+
+/// Create `p` as a new `0\n\n` label via tmp + hard link — atomic
+/// create-if-absent without the write-after-create crash window.
+/// Caller must have already established `p` does not exist.
+async fn create_label_file(p: &Path, tmp: &Path) -> io::Result<()> {
+    let mut file = fs::File::create(tmp).await?;
+    file.write_all(b"0\n\n").await?;
+    file.flush().await?;
+    fsync_fatal(&file).await?;
+    drop(file);
+
+    match fs::hard_link(tmp, p).await {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = fs::remove_file(tmp).await;
+            return match e.kind() {
+                io::ErrorKind::AlreadyExists => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "database already exists",
+                )),
+                _ => Err(e),
+            };
+        }
+    }
+    fs::remove_file(tmp).await
 }
 
 /// Write `contents` to `tmp`, fsync it, atomically replace `dest`, fsync the
@@ -326,9 +361,7 @@ impl LabelStore for DirectoryLabelStore {
     async fn create_label(&self, label: &str) -> io::Result<Label> {
         let mut p = self.path.clone();
         p.push(format!("{}.label", label));
-        let mut tmp = self.path.clone();
-        tmp.push(format!("{}.label.tmp", label));
-        let contents = b"0\n\n";
+        let tmp = label_tmp_path(&self.path, label);
         match fs::metadata(&p).await {
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -336,29 +369,7 @@ impl LabelStore for DirectoryLabelStore {
             )),
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
-                    let mut file = fs::File::create(&tmp).await?;
-                    file.write_all(contents).await?;
-                    file.flush().await?;
-                    fsync_fatal(&file).await?;
-                    drop(file);
-
-                    // hard link is an atomic create-if-absent — keeps the
-                    // exists-check of the old create_new path without the
-                    // write-after-create crash window
-                    match fs::hard_link(&tmp, &p).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            let _ = fs::remove_file(&tmp).await;
-                            return match e.kind() {
-                                io::ErrorKind::AlreadyExists => Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "database already exists",
-                                )),
-                                _ => Err(e),
-                            };
-                        }
-                    }
-                    fs::remove_file(&tmp).await?;
+                    create_label_file(&p, &tmp).await?;
                     fsync_parent_dir(&self.path).await?;
 
                     Ok(Label::new_empty(label))
@@ -396,8 +407,7 @@ impl LabelStore for DirectoryLabelStore {
 
         let mut p = self.path.clone();
         p.push(format!("{}.label", label.name));
-        let mut tmp = self.path.clone();
-        tmp.push(format!("{}.label.tmp", label.name));
+        let tmp = label_tmp_path(&self.path, &label.name);
 
         // A rename moves the path to a new inode, so a lock acquired on a
         // pre-rename inode serializes nothing: another contender can hold the
@@ -437,10 +447,8 @@ impl LabelStore for DirectoryLabelStore {
         // though the file will be gone afterwards. This is
         // indistinguishable from the case where the read/write and
         // the remove happened in reverse order.
-        let mut tmp = self.path.clone();
-        tmp.push(format!("{}.label.tmp", name));
         // crash-residue tmp of any writer is removed with the label
-        let _ = tokio::fs::remove_file(tmp).await;
+        let _ = tokio::fs::remove_file(label_tmp_path(&self.path, name)).await;
         match tokio::fs::remove_file(p).await {
             Ok(()) => Ok(true),
             Err(e) => match e.kind() {
@@ -471,6 +479,7 @@ impl CachedDirectoryLabelStore {
     /// this is an async operation.
     pub async fn open<P: Into<PathBuf>>(path: P) -> io::Result<Self> {
         let path: PathBuf = path.into();
+        sweep_stale_label_tmps(&path);
         let labels = get_all_labels_from_dir(&path).await?;
 
         Ok(Self {
@@ -521,20 +530,14 @@ impl LabelStore for CachedDirectoryLabelStore {
 
         let mut p = self.path.clone();
         p.push(format!("{}.label", label));
-        let contents = b"0\n\n";
         match fs::metadata(&p).await {
             Ok(_) => Err(io::Error::other(
                 "label was not in cached map but was found on disk",
             )),
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
-                    let mut options = fs::OpenOptions::new();
-                    options.create_new(true);
-                    options.write(true);
-                    let mut file = options.open(p).await?;
-                    file.write_all(contents).await?;
-                    file.flush().await?;
-                    file.sync_all().await?;
+                    create_label_file(&p, &label_tmp_path(&self.path, label)).await?;
+                    fsync_parent_dir(&self.path).await?;
 
                     let l = Label::new_empty(label);
                     labels.insert(label.to_string(), l.clone());
@@ -568,13 +571,13 @@ impl LabelStore for CachedDirectoryLabelStore {
                 // all good, let's a go
                 let mut p = self.path.clone();
                 p.push(format!("{}.label", label.name));
-                let mut options = fs::OpenOptions::new();
-                options.create(false);
-                options.write(true);
-                let mut file = options.open(p).await?;
-                file.write_all(&contents).await?;
-                file.flush().await?;
-                file.sync_data().await?;
+                replace_file_durable(
+                    &label_tmp_path(&self.path, &label.name),
+                    &p,
+                    &self.path,
+                    &contents,
+                )
+                .await?;
 
                 labels.insert(label.name.clone(), new_label.clone());
                 Ok(Some(new_label))
@@ -624,6 +627,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(vec![1, 2, 3], buf);
+    }
+
+    #[tokio::test]
+    async fn layer_directories_ignore_non_layer_dirs() {
+        let dir = tempdir().unwrap();
+        // the label store keeps its rename tmp files in `<store>/.tmp/` —
+        // layer enumeration must skip it, not error on the non-hex name
+        std::fs::create_dir(dir.path().join(".tmp")).unwrap();
+        let store = DirectoryLayerStore::new(dir.path());
+        assert_eq!(Vec::<[u32; 5]>::new(), store.directories().await.unwrap());
     }
 
     #[tokio::test]
@@ -985,7 +998,7 @@ mod tests {
         assert!(updated.is_some());
         // losing CAS must not leave a .label.tmp
         assert!(store.set_label(&stored, [9, 9, 9, 9, 9]).await.unwrap().is_none());
-        assert!(!dir.path().join("foo.label.tmp").exists());
+        assert!(!dir.path().join(".tmp").join("foo.label").exists());
     }
 
     #[tokio::test]
